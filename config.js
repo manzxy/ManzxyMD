@@ -19,8 +19,8 @@ const config = {
     // webhookUrl = opsional, endpoint notif bayar
     // ══════════════════════════════════════════════
     qrismu: {
-        publicKey:  'QRMU_live_60226a0253481d1292262c9d3cc97193',   // ganti dengan public key kamu
-        secretKey:  'QRMUS_ae6634388ba55071f73fa16dd80b15caca71b6344ce83280',              // ganti dengan secret key kamu
+        publicKey:  '',   // ganti dengan public key kamu
+        secretKey:  '',              // ganti dengan secret key kamu
         webhookUrl: '',                             // opsional
     },
 
@@ -29,7 +29,7 @@ const config = {
     // ══════════════════════════════════════════════
     sewabot: {
         enabled:    true,                          // aktifkan/nonaktifkan fitur sewa
-        apikey:     "HEROEOAX",      // API key heroikzre
+        apikey:     "",      // API key heroikzre
         harga: {
             "1bulan":  15000,   // Rp 15.000 / bulan
             "3bulan":  40000,   // Rp 40.000 / 3 bulan
