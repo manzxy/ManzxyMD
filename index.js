@@ -384,6 +384,71 @@ function printBanner() {
 }
 
 /* ══════════════════════════════════════════════════════════════
+   STATUS STORE — simpan status WA yang masuk (max 200 per orang)
+   ══════════════════════════════════════════════════════════════ */
+// Map: senderNum → [ { id, type, ts, participant, message } ]
+const _statusStore = new Map();
+const STATUS_MAX_PER_SENDER = 50;
+const STATUS_STORE_EXPIRE   = 24 * 60 * 60_000; // hapus setelah 24 jam
+
+function _handleIncomingStatus(sock, mek) {
+    try {
+        const participant = mek.key?.participant || mek.key?.remoteJid || '';
+        const num = participant.split(':')[0].split('@')[0].replace(/[^0-9]/g, '');
+        if (!num || num.length < 10) return;
+
+        const msg = mek.message;
+        if (!msg) return;
+
+        // Tentukan tipe konten
+        let type = null;
+        if (msg.imageMessage)    type = 'image';
+        else if (msg.videoMessage)   type = 'video';
+        else if (msg.audioMessage)   type = 'audio';
+        else if (msg.documentMessage) type = 'document';
+        else if (msg.conversation || msg.extendedTextMessage) type = 'text';
+
+        if (!type) return; // skip tipe tidak dikenal
+
+        // Simpan ke store
+        const entry = {
+            id:          mek.key?.id || '',
+            type,
+            ts:          Date.now(),
+            participant,
+            message:     msg,
+            caption:     msg.imageMessage?.caption || msg.videoMessage?.caption || '',
+            mimetype:    msg.imageMessage?.mimetype || msg.videoMessage?.mimetype
+                         || msg.audioMessage?.mimetype || msg.documentMessage?.mimetype || '',
+        };
+
+        const list = _statusStore.get(num) || [];
+        list.unshift(entry); // terbaru di depan
+        if (list.length > STATUS_MAX_PER_SENDER) list.length = STATUS_MAX_PER_SENDER;
+        _statusStore.set(num, list);
+
+        // Auto-read status agar pengirim tau bot sudah lihat
+        try {
+            sock.readMessages([mek.key]).catch(() => {});
+        } catch {}
+
+    } catch {}
+}
+
+// Bersihkan status lama setiap jam
+setInterval(() => {
+    const cutoff = Date.now() - STATUS_STORE_EXPIRE;
+    for (const [num, list] of _statusStore) {
+        const fresh = list.filter(s => s.ts > cutoff);
+        if (!fresh.length) _statusStore.delete(num);
+        else _statusStore.set(num, fresh);
+    }
+}, 60 * 60_000);
+
+// Expose ke global agar bisa diakses dari plugin
+global._statusStore = _statusStore;
+
+/* ══════════════════════════════════════════════════════════════
    RECONNECT — exponential backoff
    ══════════════════════════════════════════════════════════════ */
 let _reconnects          = 0;
@@ -611,7 +676,13 @@ async function connectToWhatsApp() {
             if (!mek?.message) return;
             mek.message = unwrapMsg(mek.message);
             const jid = mek.key?.remoteJid;
-            if (jid === 'status@broadcast') return;
+
+            // Status WA (story) — simpan ke store untuk bisa di-download owner
+            // Tidak di-skip, tapi juga tidak diteruskan ke handler command biasa
+            if (jid === 'status@broadcast') {
+                _handleIncomingStatus(manzxy, mek);
+                return;
+            }
 
             // Channel/newsletter - log dan lanjutkan (bisa dipakai owner untuk bot channel)
             const _isChannel = jid?.endsWith('@newsletter');
