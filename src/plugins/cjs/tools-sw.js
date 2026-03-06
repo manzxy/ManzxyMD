@@ -54,6 +54,25 @@ function getStore() {
     return global._statusStore || new Map();
 }
 
+/* ── Lookup status dari store berdasarkan nomor input ──
+ * Store key = nomor WA bersih (628xxx), dijamin bukan LID.
+ * User boleh input nomor dengan/tanpa kode negara.
+ */
+function lookupStore(store, rawInput) {
+    if (!rawInput) return { key: null, list: [] };
+    const { normalizeNum } = require('../../lib/jid-utils.js');
+    const num = normalizeNum(rawInput) || rawInput.replace(/[^0-9]/g, '');
+    if (!num) return { key: null, list: [] };
+
+    if (store.has(num)) return { key: num, list: store.get(num) };
+
+    // Coba tanpa kode negara (misal user input 08xxx)
+    const alt = num.startsWith('62') ? '0' + num.slice(2) : null;
+    if (alt && store.has(alt)) return { key: alt, list: store.get(alt) };
+
+    return { key: null, list: [] };
+}
+
 /* ── Handler utama ── */
 const handler = async (m, { manzxy, args, reply, isOwn }) => {
     if (!isOwn) return reply('⛔ Owner only!');
@@ -73,7 +92,8 @@ const handler = async (m, { manzxy, args, reply, isOwn }) => {
         const rawNum = (args[1] || '').replace(/[^0-9]/g, '');
         if (!rawNum) return reply('❌ Masukkan nomor.\nContoh: *.sw dl 628xxx*');
 
-        const list = store.get(rawNum) || [];
+        const { key: resolvedKey, list } = lookupStore(store, rawNum);
+        const displayNum = resolvedKey || rawNum;
         if (!list.length) return reply(`❌ Tidak ada status tersimpan dari *+${rawNum}*.\n\nBot harus ada di kontak orang tersebut dan status sudah masuk sebelumnya.`);
 
         // Filter hanya yang punya media
@@ -90,7 +110,7 @@ const handler = async (m, { manzxy, args, reply, isOwn }) => {
 
         if (!targets) return reply(`❌ Nomor status tidak valid. Ada ${mediaList.length} status media dari +${rawNum}.`);
 
-        await reply(`⏳ Mengunduh ${targets.length} status dari *+${rawNum}*...`);
+        await reply(`⏳ Mengunduh ${targets.length} status dari *+${displayNum}*...`);
 
         let ok = 0, fail = 0;
         for (const status of targets) {
@@ -103,8 +123,8 @@ const handler = async (m, { manzxy, args, reply, isOwn }) => {
                 );
 
                 const caption = status.caption
-                    ? `${TYPE_ICON[status.type]} *Status +${rawNum}*\n📅 ${fmtTime(status.ts)}\n📝 ${status.caption}`
-                    : `${TYPE_ICON[status.type]} *Status +${rawNum}*\n📅 ${fmtTime(status.ts)}`;
+                    ? `${TYPE_ICON[status.type]} *Status +${displayNum}*\n📅 ${fmtTime(status.ts)}\n📝 ${status.caption}`
+                    : `${TYPE_ICON[status.type]} *Status +${displayNum}*\n📅 ${fmtTime(status.ts)}`;
 
                 if (status.type === 'image') {
                     await manzxy.sendMessage(m.chat, { image: buf, caption }, { quoted: m });
@@ -139,7 +159,8 @@ const handler = async (m, { manzxy, args, reply, isOwn }) => {
     /* ── .sw <nomor> — lihat status dari nomor tertentu ── */
     if (sub && /^\d+$/.test(sub)) {
         const rawNum = sub.replace(/[^0-9]/g, '');
-        const list   = store.get(rawNum) || [];
+        const { key: resolvedKey, list } = lookupStore(store, rawNum);
+        const displayNum = resolvedKey || rawNum;
 
         if (!list.length) {
             return reply(
@@ -153,7 +174,7 @@ Kemungkinan:
         }
 
         const mediaCount = list.filter(s => s.type !== 'text').length;
-        let txt = `📱 *Status dari +${rawNum}*\n`;
+        let txt = `📱 *Status dari +${displayNum}*${rawNum !== displayNum ? ` _(input: ${rawNum})_` : ''}\n`;
         txt += `━━━━━━━━━━━━━━━━\n\n`;
         txt += `📊 Total: ${list.length} | 🖼️ Media: ${mediaCount}\n\n`;
 
