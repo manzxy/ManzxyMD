@@ -202,15 +202,13 @@ exports.parseMention = (text = '') => {
 }
 
 exports.getGroupAdm = (participants) => {
+    const { forceJid } = require('../lib/jid-utils.js');
     const admins = [];
     for (const i of participants) {
         if (i.admin === 'superadmin' || i.admin === 'admin') {
-            // Resolve LID → JID via _lidToJidMap
-            let id = i.id;
-            if (id && (id.includes('@lid') || id.includes('@s.lid'))) {
-                id = global._lidToJidMap?.[id] || i.lidAlt || id;
-            }
-            admins.push(id);
+            // forceJid: LID → resolve → JID bersih; tidak pernah return @lid
+            const jid = forceJid(i.id, participants);
+            if (jid) admins.push(jid);
         }
     }
     return admins;
@@ -255,44 +253,11 @@ exports.smsg = (conn, m, store) => {
             if (_pvClean) {
                 m.sender = _pvClean;
             } else if (_pvRaw.includes('@lid') || _pvRaw.includes('@s.lid')) {
-                // LID — coba resolve ke nomor asli via beberapa cara:
-                // 1. conn.contacts[lid].notify / vname — Baileys simpan contact info
-                // 2. conn.decodeJid
-                // 3. lidAlt dari store
-                let resolved = null;
-                // 1. _lidToJidMap (dikumpulkan dari pesan grup secara real-time)
-                if (global._lidToJidMap?.[_pvRaw]) {
-                    resolved = global._lidToJidMap[_pvRaw];
-                }
-                // 2. ownerLid dari config
-                if (!resolved) {
-                    try {
-                        const _cfg = require('../../config.js').config;
-                        const _oIdx = (_cfg.ownerLid || []).indexOf(_pvRaw);
-                        if (_oIdx >= 0 && _cfg.owner?.[_oIdx]) {
-                            const num = String(_cfg.owner[_oIdx]).replace(/[^0-9]/g, '');
-                            if (num.length >= 10 && num.length <= 15) resolved = num + '@s.whatsapp.net';
-                        }
-                    } catch {}
-                }
-                // 3. contacts store
-                if (!resolved) {
-                    try {
-                        const contact = conn.contacts?.[_pvRaw];
-                        if (contact?.phoneNumber) {
-                            const num = String(contact.phoneNumber).replace(/[^0-9]/g, '');
-                            if (num.length >= 10 && num.length <= 15) resolved = num + '@s.whatsapp.net';
-                        }
-                    } catch {}
-                }
-                // 4. decodeJid
-                if (!resolved) {
-                    try {
-                        const decoded = conn.decodeJid ? conn.decodeJid(_pvRaw) : null;
-                        if (decoded && !decoded.includes('@lid')) resolved = _cleanJidFull(decoded);
-                    } catch {}
-                }
-                m.sender = resolved || _pvRaw;
+                // LID di PV — resolve via forceJid (semua sumber dicoba)
+                const { forceJid } = require('../lib/jid-utils.js');
+                const resolved = forceJid(_pvRaw, [], conn);
+                // Jika gagal resolve, sender kosong (bukan LID) — manzxy.js akan handle
+                m.sender = resolved || '';
             } else {
                 m.sender = _pvRaw;
             }
@@ -304,29 +269,23 @@ exports.smsg = (conn, m, store) => {
                 // participantAlt valid — pakai langsung
                 m.sender = _cleanJidFull(_altJid) || _altJid;
             } else {
-                // Tidak ada participantAlt — coba participant, skip jika LID
+                // Tidak ada participantAlt — coba participant
+                const { forceJid } = require('../lib/jid-utils.js');
                 const _partRaw = m.participant || m.key.participant || '';
-                if (_partRaw.includes('@lid') || _partRaw.includes('@s.lid')) {
-                    // LID: coba resolve via _lidToJidMap
-                    const _mapped = global._lidToJidMap?.[_partRaw];
-                    m.sender = _mapped || _altJid || '';
-                } else {
-                    m.sender = _cleanJidFull(_partRaw) || _partRaw;
-                }
+                const _resolved = forceJid(_partRaw, [], conn);
+                m.sender = _resolved || '';
             }
         }
         if (m.isGroup) {
             // m.participant = JID bersih anggota yang kirim pesan
+            const { forceJid: _fj } = require('../lib/jid-utils.js');
             const _altPart = m.key.participantAlt;
             if (_altPart && (_altPart.includes('@s.whatsapp.net') || _altPart.includes('@c.us'))) {
                 m.participant = _cleanJidFull(_altPart) || _altPart;
             } else {
                 const _partRaw = m.key.participant || '';
-                if (_partRaw.includes('@lid') || _partRaw.includes('@s.lid')) {
-                    m.participant = global._lidToJidMap?.[_partRaw] || '';
-                } else {
-                    m.participant = _cleanJidFull(_partRaw) || _partRaw;
-                }
+                const _pResolved = _fj(_partRaw, [], conn);
+                m.participant = _pResolved || '';
             }
         }
     }
@@ -389,11 +348,8 @@ exports.smsg = (conn, m, store) => {
 				const d = conn.decodeJid ? conn.decodeJid(_raw386) : (_raw386.split(':')[0] + (_raw386.includes('@') ? '@' + _raw386.split('@')[1] : ''));
 				if (!d) return '';
 				if (d.includes('@lid') || d.includes('@s.lid')) {
-					// Coba resolve via _lidToJidMap (dikumpulkan dari pesan grup)
-					const mapped = global._lidToJidMap?.[d];
-					if (mapped) return mapped;
-					// Jangan strip digit LID — digit LID panjangnya tidak valid sebagai nomor WA
-					return '';
+					const { forceJid: _fqj } = require('../lib/jid-utils.js');
+					return _fqj(d, [], conn) || '';
 				}
 				return d;
 			})();
