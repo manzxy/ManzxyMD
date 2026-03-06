@@ -769,6 +769,15 @@ CC-BY-NC-4.0 — Creative Commons Attribution NonCommercial 4.0
 
 ---
 
+## 🤗 TQTO
+
+[WJayadana](https://github.com/WJadayana): Pemilik Base
+Claude Ai: Pembantu Fix Fitur
+my family 
+dan sebagainya yang ga bisa saya sebutin disni🤗
+
+---
+
 ## 💬 Kontak & Support
 
 <div align="center">
