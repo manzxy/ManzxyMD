@@ -33,9 +33,9 @@ const db = new BetterSqlite(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous  = NORMAL');
 db.pragma('foreign_keys = ON');
-db.pragma('cache_size   = -32000'); // 32 MB cache
+db.pragma('cache_size   = -8192');  // 8 MB cache — cukup untuk low-spec
 db.pragma('temp_store   = MEMORY');  // temp table di RAM, bukan disk
-db.pragma('mmap_size    = 67108864'); // 64 MB mmap untuk reads lebih cepat
+db.pragma('mmap_size    = 16777216'); // 16 MB mmap
 
 /* ── Skema Tabel ───────────────────────────────────────────── */
 db.exec(`
@@ -212,9 +212,14 @@ function deepMerge(target, source) {
 function _normalizeJid(jid) {
     if (!jid) return null;
     if (jid.includes('@g.us')) return jid;
-    if (jid.includes('@lid'))  return jid;
+    if (jid.includes('@newsletter')) return jid;
+    // @lid TIDAK boleh masuk DB — resolve dulu via forceJid
+    if (jid.includes('@lid') || jid.includes('@s.lid')) {
+        const { forceJid } = require('./jid-utils.js');
+        return forceJid(jid) || null;
+    }
     const num = jid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '');
-    return num ? num + '@s.whatsapp.net' : jid;
+    return num ? num + '@s.whatsapp.net' : null;
 }
 
 /* ═══════════════════════════════════════════════════════════
