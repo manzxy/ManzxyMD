@@ -785,7 +785,7 @@ CC-BY-NC-4.0 — Creative Commons Attribution NonCommercial 4.0
 <img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=100&section=footer" width="100%"/>
 
 **Made with ❤️ by [Manzxy](https://github.com/manzxy)**  
-*Recode from LingerBase — ManzxyMD v2.0*
+*Recode from [LingerBase](https://github.com/WJayadana/LingerBase)— ManzxyMD v2.0*
 
 ⭐ **Star repo ini jika bermanfaat!**
 
