@@ -31,18 +31,6 @@
 
 ---
 
-## 📸 Preview
-
-<div align="center">
-<img src="https://i.imgur.com/placeholder-bot-preview.png" width="280" alt="Bot Preview"/>
-&nbsp;&nbsp;
-<img src="https://i.imgur.com/placeholder-menu.png" width="280" alt="Menu Preview"/>
-</div>
-
-> *Ganti URL gambar di atas dengan screenshot botmu sendiri setelah running*
-
----
-
 ## ✨ Fitur Unggulan
 
 <table>
