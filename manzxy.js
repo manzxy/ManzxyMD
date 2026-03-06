@@ -239,8 +239,8 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
             return num ? num + '@s.whatsapp.net' : null;
         };
 
-        // isLid — cek apakah JID adalah LID format
-        const isLid = (jid) => !!(jid && (jid.includes('@lid') || jid.includes('@s.lid')));
+        // isLid — via jid-utils (centralized)
+        const { forceJid: _forceJid } = require('./src/lib/jid-utils.js');
 
         const getCorrectSender = (m) => {
             // FIX: di PV, sender SELALU = remoteJid (bukan bot ID)
@@ -322,12 +322,7 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
          *   3. Jadibot: sender = ownerNum jadibot yang terdaftar
          * ─────────────────────────────────────────────────── */
         const _ownerNums = [...Owner, ...config.owner].map(normalizeNum).filter(Boolean);
-        // ownerLid: LID tambahan untuk owner — diisi otomatis dari store saat bot jalan
-        // atau bisa diisi manual di config.ownerLid = ['208843271364847@lid']
-        const _ownerLids = new Set([
-            ...(config.ownerLid || []),
-            ...(global._ownerLidCache || []),
-        ]);
+
 
         // Jadibot owner: sock._jadibotOwner.ownerNum
         // FIX: validasi panjang — LID digit > 15 dianggap invalid
@@ -355,27 +350,15 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
             isOwn = _ownerNums.includes(senderNum)
                  || (_jadibotOwnerNum && senderNum === _jadibotOwnerNum);
         }
-        // FIX LID PV: cek remoteJid / sender langsung sebagai LID
-        if (!isOwn && !m.isGroup) {
-            const _rawLid = m.key?.remoteJid || m.sender || '';
-            if (_rawLid.includes('@lid') && _ownerLids.has(_rawLid)) {
-                isOwn = true;
-                // Fix senderJid/senderNum supaya display nomor benar (dari config.owner)
-                if (!senderNum || senderNum.length > 15) {
-                    const _ownerJid = config.owner?.[0];
-                    if (_ownerJid) {
-                        senderJid = _ownerJid.includes('@') ? _ownerJid : _ownerJid + '@s.whatsapp.net';
-                    }
-                }
-            }
-        }
+        // Guard: sender kosong atau masih LID setelah smsg() → tidak proses
+        if (!senderJid || senderJid.includes('@lid')) return;
 
         // FALLBACK isOwn: jika senderNum gagal/LID, coba sumber lain
         // Filter: hanya nomor valid 10-15 digit (bukan LID angka panjang)
         if (!isOwn && !m.isGroup && !m.key.fromMe) {
             const _validNum = (raw) => {
                 if (!raw) return '';
-                if (isLid(raw)) return ''; // skip LID mentah
+                if (!raw || raw.includes('@lid') || raw.includes('@s.lid')) return '';
                 const n = normalizeNum(raw);
                 return (n.length >= 10 && n.length <= 15) ? n : '';
             };
@@ -385,7 +368,7 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
             for (const fn of _fallbackNums) {
                 if (_ownerNums.includes(fn) || (_jadibotOwnerNum && fn === _jadibotOwnerNum)) {
                     isOwn = true;
-                    if (!senderNum || !senderJid || isLid(senderJid)) {
+                    if (!senderNum || !senderJid) {
                         senderJid = fn + '@s.whatsapp.net';
                     }
                     break;
@@ -469,16 +452,14 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
 
                 // FIX: getParticipantNum — prioritas phoneNumber, fallback id non-LID, resolve LID via map
                 const getParticipantNum = (p) => {
+                    // forceJid: resolve LID → JID → normalizeNum
+                    const jid = _forceJid(p.id, participants);
+                    if (jid) return normalizeNum(jid);
                     if (p.phoneNumber) {
                         const n = String(p.phoneNumber).replace(/[^0-9]/g, '');
                         if (n.length >= 10 && n.length <= 15) return n;
                     }
-                    if (p.id && !p.id.includes('@lid') && !p.id.includes('@s.lid')) return normalizeNum(p.id);
-                    if (p.lidAlt && !p.lidAlt.includes('@lid')) return normalizeNum(p.lidAlt);
-                    // Resolve LID via _lidToJidMap — JANGAN strip digit LID mentah (terlalu panjang)
-                    const mapped = global._lidToJidMap?.[p.id];
-                    if (mapped) return normalizeNum(mapped);
-                    return ''; // LID tidak bisa di-resolve — return kosong
+                    return '';
                 };
 
                 // FIX: senderRaw pakai participantAlt dulu (tidak pernah LID)
@@ -490,17 +471,8 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
 
                 const adminParticipants = participants.filter(p => p.admin !== null && p.admin !== undefined);
 
-                // FIX: groupAdmin resolve LID via _lidToJidMap
                 groupAdmin = adminParticipants.map(p => {
-                    if (p.phoneNumber) {
-                        const n = String(p.phoneNumber).replace(/[^0-9]/g, '');
-                        if (n.length >= 10 && n.length <= 15) return n + '@s.whatsapp.net';
-                    }
-                    if (!p.id.includes('@lid') && !p.id.includes('@s.lid')) return p.id;
-                    const mapped = global._lidToJidMap?.[p.id];
-                    if (mapped) return mapped;
-                    if (p.lidAlt && !p.lidAlt.includes('@lid')) return normalizeNum(p.lidAlt) + '@s.whatsapp.net';
-                    return null; // LID tidak terselesaikan — exclude dari admin list
+                    return _forceJid(p.id, participants) || null;
                 }).filter(Boolean);
 
                 isAdmin = adminParticipants.some(p => {
@@ -745,8 +717,8 @@ Limit reset otomatis setiap 12 jam.`
             const remaining = user.limit;
             const _limitMsg =
                 remaining <= 0
-                    ? `⚠️ *Limitmu habis!*\nLimit reset otomatis 12 jam lagi.`
-                    : `🔢 *Limit terpakai* ${limitCost > 1 ? `(${limitCost}x)` : ''}\n💳 Sisa limit: *${remaining}*`;
+                    ? `\n\n⚠️ *Limitmu habis!*\nLimit reset otomatis 12 jam lagi.`
+                    : `\n\n🔢 *Limit terpakai* ${limitCost > 1 ? `(${limitCost}x)` : ''}\n💳 Sisa limit: *${remaining}*`;
             try { await manzxy.sendMessage(m.chat, { text: _limitMsg }, { quoted: m }); } catch {}
         }
 
