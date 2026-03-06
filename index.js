@@ -62,22 +62,11 @@ const question = q => new Promise(res => {
 });
 
 /* ══════════════════════════════════════════════════════════════
-   LID → JID GLOBAL MAP
+   LID → JID INTERNAL CACHE
+   Map ini dikumpulkan otomatis dari pesan masuk (participantAlt).
+   Tidak perlu konfigurasi manual — semua resolve via forceJid().
    ══════════════════════════════════════════════════════════════ */
-global._ownerLidCache = global._ownerLidCache || new Set();
-global._lidToJidMap   = global._lidToJidMap   || (() => {
-    let map = {};
-    try { map = require('./src/lib/database.js').loadLidMap() || {}; } catch {}
-    try {
-        (config.ownerLid || []).forEach((lid, i) => {
-            if (!lid || map[lid]) return;
-            const num = String(config.owner?.[i] || '').replace(/[^0-9]/g, '');
-            if (num.length >= 10 && num.length <= 15) map[lid] = num + '@s.whatsapp.net';
-        });
-        (config.ownerLid || []).forEach(lid => { if (lid) global._ownerLidCache.add(lid); });
-    } catch {}
-    return map;
-})();
+global._lidToJidMap = global._lidToJidMap || {};
 
 /* ══════════════════════════════════════════════════════════════
    IN-MEMORY STORE
@@ -88,23 +77,23 @@ function makeStore() {
         contacts, messages, chats,
         bind(ev) {
             ev.on('contacts.upsert', list => {
-                for (const c of list) {
-                    contacts[c.id] = { ...(contacts[c.id] || {}), ...c };
-                    if (!c.id?.includes('@lid')) continue;
-                    const src = c.phoneNumber || c.lidAlt || c.notify || '';
-                    const num = String(src).replace(/[^0-9]/g, '');
-                    if (num.length >= 10 && num.length <= 15)
-                        global._lidToJidMap[c.id] = num + '@s.whatsapp.net';
+                for (const ct of list) {
+                    contacts[ct.id] = { ...(contacts[ct.id] || {}), ...ct };
+                    if (!ct.id?.includes('@lid')) continue;
+                    // Resolve LID → JID dan cache
+                    const { resolveLid } = require('./src/lib/jid-utils.js');
+                    const jid = resolveLid(ct.id, [ct]);
+                    if (jid) global._lidToJidMap[ct.id] = jid;
                 }
             });
             ev.on('contacts.update', list => {
                 for (const u of list) {
                     if (!u.id) continue;
                     contacts[u.id] = { ...(contacts[u.id] || {}), ...u };
-                    if (u.id.includes('@lid') && u.phoneNumber) {
-                        const num = String(u.phoneNumber).replace(/[^0-9]/g, '');
-                        if (num.length >= 10 && num.length <= 15)
-                            global._lidToJidMap[u.id] = num + '@s.whatsapp.net';
+                    if (u.id.includes('@lid')) {
+                        const { resolveLid } = require('./src/lib/jid-utils.js');
+                        const jid = resolveLid(u.id, [u]);
+                        if (jid) global._lidToJidMap[u.id] = jid;
                     }
                 }
             });
@@ -117,15 +106,14 @@ function makeStore() {
                     if (!messages[jid]) messages[jid] = [];
                     messages[jid].push(m);
                     if (messages[jid].length > 20) messages[jid].shift(); // max 20 msg per JID
-                    if (m.key?.addressingMode === 'lid'
-                        && m.key.participant?.includes('@lid')
-                        && m.key.participantAlt?.includes('@s.whatsapp.net')) {
+                    // Kumpulkan mapping LID → JID dari setiap pesan masuk
+                    if (m.key?.participant?.includes('@lid') && m.key.participantAlt?.includes('@s.whatsapp.net')) {
                         global._lidToJidMap[m.key.participant] = m.key.participantAlt;
                     }
-                    if (jid.includes('@lid') && m.key?.remoteJidAlt?.includes('@s.whatsapp.net')) {
-                        const num = m.key.remoteJidAlt.split(':')[0].split('@')[0].replace(/[^0-9]/g, '');
-                        if (num.length >= 10 && num.length <= 15)
-                            global._lidToJidMap[jid] = num + '@s.whatsapp.net';
+                    if (jid?.includes('@lid') && m.key?.remoteJidAlt?.includes('@s.whatsapp.net')) {
+                        const _rAlt = m.key.remoteJidAlt.split(':')[0].split('@')[0].replace(/[^0-9]/g, '');
+                        if (_rAlt.length >= 10 && _rAlt.length <= 15)
+                            global._lidToJidMap[jid] = _rAlt + '@s.whatsapp.net';
                     }
                 }
             });
@@ -278,17 +266,13 @@ function cleanupMemory() {
     const adzanKeys = Object.keys(_adzanSent);
     if (adzanKeys.length > 500) adzanKeys.slice(0, 300).forEach(k => delete _adzanSent[k]);
 
-    /* Trim _lidToJidMap — jaga max 5000 entries */
+    /* Trim _lidToJidMap — jaga max 1000 entries */
     const lidKeys = Object.keys(global._lidToJidMap || {});
-    if (lidKeys.length > 1000) {
-        lidKeys.slice(0, 500).forEach(k => {
-            if (!global._ownerLidCache?.has(k)) delete global._lidToJidMap[k];
-        });
-    }
+    if (lidKeys.length > 1000) lidKeys.slice(0, 500).forEach(k => delete global._lidToJidMap[k]);
 
     /* Log RAM */
     const ram = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
-    logger.mem(`RSS: ${ram} MB | Meta: ${expired} expired | LID: ${Object.keys(global._lidToJidMap||{}).length}`);
+    logger.mem(`RSS: ${ram} MB | Meta: ${expired} expired | JID cache: ${lidKeys.length}`);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -393,44 +377,60 @@ const STATUS_STORE_EXPIRE   = 24 * 60 * 60_000; // hapus setelah 24 jam
 
 function _handleIncomingStatus(sock, mek) {
     try {
-        const participant = mek.key?.participant || mek.key?.remoteJid || '';
-        const num = participant.split(':')[0].split('@')[0].replace(/[^0-9]/g, '');
-        if (!num || num.length < 10) return;
+        // Status WA: participant bisa berupa LID (@lid) atau JID normal (@s.whatsapp.net)
+        // Prioritas: participantAlt (selalu JID normal) > participant > remoteJid
+        const rawParticipant = mek.key?.participantAlt
+                            || mek.key?.participant
+                            || mek.key?.remoteJid
+                            || '';
+
+        // Cek apakah LID — jika iya, coba resolve via _lidToJidMap
+        let resolvedJid = rawParticipant;
+        if (rawParticipant.includes('@lid') || rawParticipant.includes('@s.lid')) {
+            const { forceJid } = require('./src/lib/jid-utils.js');
+            const _resolved = forceJid(rawParticipant, [], sock);
+            resolvedJid = _resolved || null;
+            // Jika tidak bisa resolve, skip — jangan simpan dengan key LID
+            if (!resolvedJid) return;
+        }
+
+        // Ekstrak nomor dari JID bersih
+        const num = resolvedJid.split(':')[0].split('@')[0].replace(/[^0-9]/g, '');
+        if (!num || num.length < 8) return;
 
         const msg = mek.message;
         if (!msg) return;
 
         // Tentukan tipe konten
         let type = null;
-        if (msg.imageMessage)    type = 'image';
-        else if (msg.videoMessage)   type = 'video';
-        else if (msg.audioMessage)   type = 'audio';
-        else if (msg.documentMessage) type = 'document';
+        if (msg.imageMessage)             type = 'image';
+        else if (msg.videoMessage)        type = 'video';
+        else if (msg.audioMessage)        type = 'audio';
+        else if (msg.documentMessage)     type = 'document';
         else if (msg.conversation || msg.extendedTextMessage) type = 'text';
 
-        if (!type) return; // skip tipe tidak dikenal
+        if (!type) return;
 
-        // Simpan ke store
+        // Simpan entry dengan info lengkap untuk resolve nanti
         const entry = {
             id:          mek.key?.id || '',
             type,
             ts:          Date.now(),
-            participant,
+            participant: resolvedJid,   // selalu JID bersih, tidak pernah LID
             message:     msg,
             caption:     msg.imageMessage?.caption || msg.videoMessage?.caption || '',
             mimetype:    msg.imageMessage?.mimetype || msg.videoMessage?.mimetype
                          || msg.audioMessage?.mimetype || msg.documentMessage?.mimetype || '',
         };
 
+        // Simpan dengan key = nomor dari JID yang sudah di-resolve
         const list = _statusStore.get(num) || [];
-        list.unshift(entry); // terbaru di depan
+        list.unshift(entry);
         if (list.length > STATUS_MAX_PER_SENDER) list.length = STATUS_MAX_PER_SENDER;
         _statusStore.set(num, list);
 
-        // Auto-read status agar pengirim tau bot sudah lihat
-        try {
-            sock.readMessages([mek.key]).catch(() => {});
-        } catch {}
+        // Auto-read status
+        try { sock.readMessages([mek.key]).catch(() => {}); } catch {}
 
     } catch {}
 }
@@ -628,12 +628,12 @@ async function connectToWhatsApp() {
             const groupDesc = meta.desc    || '';
             const memCount  = meta.participants?.length || 0;
 
+            const { forceJid: _wForceJid } = require('./src/lib/jid-utils.js');
             for (const p of participants) {
-                let jid = typeof p === 'object' ? (p.id || String(p)) : String(p);
-                if (typeof p === 'object' && p.phoneNumber) {
+                const _rawP = typeof p === 'object' ? (p.id || String(p)) : String(p);
+                let jid = _wForceJid(_rawP, [], manzxy) || _rawP;
+                if (typeof p === 'object' && p.phoneNumber && !jid.includes('@s.whatsapp.net')) {
                     jid = p.phoneNumber.replace(/[^0-9]/g,'') + '@s.whatsapp.net';
-                } else if (jid.includes('@lid') && global._lidToJidMap[jid]) {
-                    jid = global._lidToJidMap[jid];
                 }
                 const num  = jid.split(':')[0].split('@')[0];
                 const full = `${num}@s.whatsapp.net`;
@@ -715,18 +715,12 @@ async function connectToWhatsApp() {
             if (m.isGroup) db.getGroup(m.chat);
             if (m.sender)  db.getUser(m.sender);
 
-            if (m.isGroup && mek.key?.addressingMode === 'lid') {
-                const lid = mek.key?.participant, alt = mek.key?.participantAlt;
-                if (lid?.includes('@lid') && alt?.includes('@s.whatsapp.net')) {
-                    global._lidToJidMap[lid] = alt;
-                    const n = alt.split(':')[0].split('@')[0].replace(/[^0-9]/g,'');
-                    if (_ownerNums.has(n)) global._ownerLidCache.add(lid);
-                }
+            // Kumpulkan LID → JID dari participantAlt (internal cache, tidak lolos ke plugin)
+            if (mek.key?.participant?.includes('@lid') && mek.key.participantAlt?.includes('@s.whatsapp.net')) {
+                global._lidToJidMap[mek.key.participant] = mek.key.participantAlt;
             }
-            if (!m.isGroup && m.sender?.includes('@lid')) {
-                const res = global._lidToJidMap[m.sender];
-                if (res) m.sender = res;
-            }
+            // Guard akhir: jika sender masih LID setelah smsg(), kosongkan
+            if (m.sender?.includes('@lid')) m.sender = '';
 
             // fromMe: bisa owner kirim ke bot sendiri (eval/command) ATAU bot kirim ke orang lain (outgoing)
             // Blok hanya jika benar-benar outgoing (bukan eval dan bukan command dengan prefix)
