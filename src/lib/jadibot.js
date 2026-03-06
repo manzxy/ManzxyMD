@@ -136,17 +136,16 @@ function makeStore() {
         contacts, messages, chats,
         bind(ev) {
             ev.on('contacts.upsert', list => {
-                for (const c of list) {
-                    contacts[c.id] = { ...(contacts[c.id] || {}), ...c };
-                    if (!c.id?.includes('@lid')) continue;
-                    const src = c.phoneNumber || '';
-                    const num = String(src).replace(/[^0-9]/g, '');
-                    if (num.length >= 10 && num.length <= 15) {
-                        global._lidToJidMap = global._lidToJidMap || {};
-                        global._lidToJidMap[c.id] = num + '@s.whatsapp.net';
+                    for (const ct of list) {
+                        if (!ct.id?.includes('@lid')) continue;
+                        const { resolveLid } = require('./jid-utils.js');
+                        const jid = resolveLid(ct.id, [ct]);
+                        if (jid) {
+                            global._lidToJidMap = global._lidToJidMap || {};
+                            global._lidToJidMap[ct.id] = jid;
+                        }
                     }
-                }
-            });
+                });
             ev.on('contacts.update', list => {
                 for (const c of list) {
                     if (c.id) contacts[c.id] = { ...(contacts[c.id] || {}), ...c };
@@ -165,7 +164,7 @@ function makeStore() {
                         && m.key.participant?.includes('@lid')
                         && m.key.participantAlt?.includes('@s.whatsapp.net')) {
                         global._lidToJidMap = global._lidToJidMap || {};
-                        global._lidToJidMap[m.key.participant] = m.key.participantAlt;
+                        global._lidToJidMap[m.key.participant] = m.key.participantAlt;  // cache internal saja
                     }
                 }
             });
@@ -614,6 +613,11 @@ async function startJadiBot(number, method = 'pairing', notifJid = null, ownerIn
         try {
             const mek = chatUpdate.messages[0];
             if (!mek?.message || mek.key?.remoteJid === 'status@broadcast') return;
+            // Resolve LID di participant sebelum handler
+            if (mek.key?.participant?.includes('@lid') && mek.key.participantAlt?.includes('@s.whatsapp.net')) {
+                global._lidToJidMap = global._lidToJidMap || {};
+                global._lidToJidMap[mek.key.participant] = mek.key.participantAlt;
+            }
 
             // Channel/newsletter — skip jika tidak ada command
             const _jbJid     = mek.key?.remoteJid || '';
