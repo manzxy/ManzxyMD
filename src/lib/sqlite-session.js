@@ -22,31 +22,36 @@ const Database = require('better-sqlite3');
 function _openDb(dbPath) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
-    const db = new Database(dbPath, {
-        // Timeout 10 detik sebelum SQLITE_BUSY → memberi waktu write selesai
-        timeout: 10_000,
-        // verbose: console.log, // uncomment untuk debug
-    });
+    // Coba buka, jika corrupt → hapus dan buat ulang (creds hilang tapi tidak crash)
+    let db;
+    try {
+        db = new Database(dbPath, { timeout: 10_000 });
+        // Quick integrity check — deteksi corrupt sebelum dipakai
+        const check = db.pragma('integrity_check', { simple: true });
+        if (check !== 'ok') {
+            console.error(`[SESSION] DB corrupt (${check}) — rebuild: ${dbPath}`);
+            db.close();
+            const bak = dbPath + '.corrupt.' + Date.now();
+            try { fs.renameSync(dbPath, bak); console.log('[SESSION] Backup:', bak); } catch {}
+            db = new Database(dbPath, { timeout: 10_000 });
+        }
+    } catch (e) {
+        console.error('[SESSION] Open error — rebuild:', e.message);
+        try { fs.unlinkSync(dbPath); } catch {}
+        try { fs.unlinkSync(dbPath + '-shm'); } catch {}
+        try { fs.unlinkSync(dbPath + '-wal'); } catch {}
+        db = new Database(dbPath, { timeout: 10_000 });
+    }
 
-    // WAL mode — banyak reader, 1 writer, tidak ada locking
     db.pragma('journal_mode = WAL');
-
-    // NORMAL sync = cukup aman + lebih cepat dari FULL
     db.pragma('synchronous = NORMAL');
-
-    // 32 MB cache — kurangi disk I/O
-    db.pragma('cache_size = -16384'); // 16MB — cukup untuk low-spec
-
-    // Batasi WAL file agar tidak tumbuh tak terbatas
+    db.pragma('cache_size = -16384');
     db.pragma('wal_autocheckpoint = 1000');
-
-    // Busy handler — retry otomatis jika DB sedang di-write
     db.pragma('busy_timeout = 10000');
-
-    // 64 MB mmap untuk reads cepat
-    db.pragma('mmap_size = 33554432'); // 32MB mmap
-    // Temp table di RAM
+    db.pragma('mmap_size = 33554432');
     db.pragma('temp_store = MEMORY');
+    // Batasi ukuran WAL — cegah disk penuh di VPS kecil
+    db.pragma('page_size = 4096');
 
     db.exec(`
         CREATE TABLE IF NOT EXISTS sessions (
@@ -235,6 +240,28 @@ function deleteSession(sessionId) {
     } catch {}
 }
 
+/* ─────────────────────────────────────────────────────────────
+   clearSignalKeys — hapus HANYA signal keys yang corrupt
+   (sender-key-*, session-*, pre-key-*, sender-key-memory-*)
+   TIDAK menghapus creds — bot tidak perlu scan ulang QR/pairing
+   ───────────────────────────────────────────────────────────── */
+function clearSignalKeys(sessionId) {
+    try {
+        const db = _getDb(sessionId);
+        // Hapus semua kecuali 'creds' dan 'app-state-*'
+        db.prepare(`
+            DELETE FROM sessions
+            WHERE session_id = ?
+            AND key_id NOT IN ('creds')
+            AND key_id NOT LIKE 'app-state-%'
+        `).run(sessionId);
+        return true;
+    } catch (e) {
+        console.error('[SESSION] clearSignalKeys error:', e.message);
+        return false;
+    }
+}
+
 function listSessions(prefix) {
     try {
         const db   = _getDb(prefix + 'dummy');
@@ -266,4 +293,4 @@ function _walCheckpoint() {
     }
 }
 
-module.exports = { useSQLiteAuthState, sessionExists, deleteSession, listSessions, _walCheckpoint };
+module.exports = { useSQLiteAuthState, sessionExists, deleteSession, clearSignalKeys, listSessions, _walCheckpoint };
