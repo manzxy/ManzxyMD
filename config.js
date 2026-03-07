@@ -3,33 +3,19 @@ const fs = require('fs');
 const config = {
     prefa: [".", "#", "!"],
     owner: ['6288989721627'],
-    // LID owner — isi dengan LID kamu (lihat dari log [PV_DEBUG])
-    // LID kamu: 208843271364847@lid
-    ownerLid: ['208843271364847@lid'],
+    // ownerLid sudah tidak diperlukan — bot otomatis kenali owner dari nomor di atas
     thumbnail: "https://c.termai.cc/a160/RfVQey8.jpg",
     nameBot: "Yogiri",
     nameOwn: "Manzxy",
     version: "2.0",
 
     // ══════════════════════════════════════════════
-    // 💳 QRISMU PAYMENT CONFIG
-    // Daftar & ambil key di https://www.qrismu.app
-    // publicKey  = X-API-Key  (QRMU_live_xxxx)
-    // secretKey  = untuk HMAC-SHA256 signature
-    // webhookUrl = opsional, endpoint notif bayar
-    // ══════════════════════════════════════════════
-    qrismu: {
-        publicKey:  '',   // ganti dengan public key kamu
-        secretKey:  '',              // ganti dengan secret key kamu
-        webhookUrl: '',                             // opsional
-    },
-
-    // ══════════════════════════════════════════════
     // 🏪 SEWABOT CONFIG
+    // Isi apikey dari https://restapi.heroikzre.my.id
     // ══════════════════════════════════════════════
     sewabot: {
         enabled:    true,                          // aktifkan/nonaktifkan fitur sewa
-        apikey:     "",      // API key heroikzre
+        apikey:     "HEROEOAX",      // API key heroikzre
         harga: {
             "1bulan":  15000,   // Rp 15.000 / bulan
             "3bulan":  40000,   // Rp 40.000 / 3 bulan
