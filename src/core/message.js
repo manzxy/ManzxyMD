@@ -7,7 +7,6 @@ const moment = require('moment-timezone')
 const { sizeFormatter } = require('human-readable')
 const util = require('util')
 const Jimp = require('jimp')
-const { defaultMaxListeners } = require('stream')
 
 
 const unixTimestampSeconds = (date = new Date()) => Math.floor(date.getTime() / 1000)
@@ -156,13 +155,17 @@ exports.logic = (check, inp, out) => {
 }
 
 exports.generateProfilePicture = async (buffer) => {
-	const jimp = await Jimp.read(buffer)
-	const min = jimp.getWidth()
-	const max = jimp.getHeight()
-	const cropped = jimp.crop(0, 0, min, max)
-	return {
-		img: await cropped.scaleToFit(720, 720).getBufferAsync(Jimp.MIME_JPEG),
-		preview: await cropped.scaleToFit(720, 720).getBufferAsync(Jimp.MIME_JPEG)
+	try {
+		const jimp = await Jimp.read(buffer);
+		const min = jimp.getWidth();
+		const max = jimp.getHeight();
+		const size = Math.min(min, max);
+		const cropped = jimp.crop(0, 0, size, size);
+		const img = await cropped.scaleToFit(720, 720).getBufferAsync(Jimp.MIME_JPEG);
+		return { img, preview: img };
+	} catch (e) {
+		// Fallback: return buffer as-is
+		return { img: buffer, preview: buffer };
 	}
 }
 
@@ -417,7 +420,7 @@ exports.smsg = (conn, m, store) => {
 	 */
 	m.copyNForward = (jid = m.chat, forceForward = false, options = {}) => conn.copyNForward(jid, m, forceForward, options)
 
-conn.appenTextMessage = async(text, chatUpdate) => {
+conn.appendTextMessage = conn.appenTextMessage = async(text, chatUpdate) => {
 let messages = await generateWAMessage(m.chat, { text: text, mentions: m.mentionedJid }, {
 userJid: conn.user.id,
 quoted: m.quoted && m.quoted.fakeObj
