@@ -604,6 +604,7 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
             user,
             pushname,
             quoted,
+            store,                  // in-memory store (contacts, messages, chats)
 isJadiBot: _isJadiBot,  // true jika request dari jadibot (bukan bot utama)
             isBotSelf,              // true jika pesan dari nomor bot sendiri (bukan owner)
         };
