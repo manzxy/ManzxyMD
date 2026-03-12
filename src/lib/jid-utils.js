@@ -155,4 +155,53 @@ function extractNum(m, args = [], participants = []) {
     return jid ? normalizeNum(jid) : null;
 }
 
-module.exports = { normalizeNum, numToJid, cleanJid, isLid, resolveLid, resolveJid, extractTarget, extractNum };
+/* ── forceJid ─────────────────────────────────────────────────
+ * Resolusi paksa: LID → JID via semua sumber yang tersedia.
+ * Dipakai di smsg() dan manzxy.js saat iterasi participants.
+ *
+ * @param {string}   raw          - JID/LID/nomor mentah
+ * @param {Array}    participants - array participant grup (opsional)
+ * @param {object}   conn         - Baileys socket (opsional, untuk cache contacts)
+ * @returns {string|null}         - "628xxx@s.whatsapp.net" atau null
+ */
+function forceJid(raw, participants = [], conn = null) {
+    if (!raw) return null;
+    const s = String(raw);
+
+    // Sudah JID bersih → langsung return
+    if (s.includes('@s.whatsapp.net') && !isLid(s)) return cleanJid(s);
+
+    // LID → coba resolve semua sumber
+    if (isLid(s)) {
+        // 1. participants list
+        const fromPart = resolveLid(s, participants);
+        if (fromPart) return fromPart;
+
+        // 2. conn.contacts (Baileys stores contacts with notify/pushName)
+        if (conn?.contacts) {
+            for (const [cid, cdata] of Object.entries(conn.contacts)) {
+                if (!cid || isLid(cid)) continue;
+                if ((cdata?.lid && cdata.lid === s) ||
+                    (cdata?.lidAlt && cdata.lidAlt === s)) {
+                    const n = normalizeNum(cid);
+                    if (n) {
+                        const jid = n + '@s.whatsapp.net';
+                        if (!global._lidToJidMap) global._lidToJidMap = {};
+                        global._lidToJidMap[s] = jid;
+                        return jid;
+                    }
+                }
+            }
+        }
+
+        // 3. Global map fallback
+        if (global._lidToJidMap?.[s]) return global._lidToJidMap[s];
+
+        return null; // tidak bisa resolve
+    }
+
+    // Nomor biasa / JID format lain
+    return cleanJid(s) || numToJid(normalizeNum(s)) || null;
+}
+
+module.exports = { normalizeNum, numToJid, cleanJid, isLid, resolveLid, resolveJid, extractTarget, extractNum, forceJid };
