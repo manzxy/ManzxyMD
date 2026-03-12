@@ -181,7 +181,8 @@ const defaultUser = {
     equipment: { weapon: null, armor: null },
     cooldown: { adventure: 0, daily: 0, hunt: 0, mine: 0 },
     lastLimitReset: 0,
-    warn: {}
+    warn: {},
+    saldo: 0
 };
 
 const defaultGroup = {
