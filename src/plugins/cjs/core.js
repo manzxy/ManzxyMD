@@ -90,7 +90,9 @@ const buildMenuSection = (title, plugins) => {
             lines.push(`\n│  .${cmd} — ${desc}`);
         }
         if (!lines.length) continue; // skip tag kosong setelah dedup
-        text += `\n│\n│ ❏ *${tag.toUpperCase()}*`;
+        const _TAG_ICON = { ai:'🤖', downloader:'📥', tools:'🛠️', group:'👥', info:'ℹ️', main:'⚙️', owner:'👑', rumahotp:'💳', misc:'📦' };
+        const _tagLabel = (_TAG_ICON[tag] || '❏') + ' *' + tag.toUpperCase() + '*';
+        text += `\n│\n│ ${_tagLabel}`;
         text += lines.join('');
     }
     text += '\n╰────────────────────';
