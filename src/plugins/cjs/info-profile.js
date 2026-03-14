@@ -154,6 +154,9 @@ const handler = async (m, { manzxy, args, command, reply, isOwn, isAdmin, from, 
             text += `  Gender  : ${genderLabel}\n`;
             text += `  Umur    : ${user.age ? user.age + " tahun" : "-"}\n`;
             text += `  Daftar  : ${user.registered ? "✅" : "❌"}\n`;
+            if ((user.saldo ?? 0) > 0) {
+                text += `  💳 Saldo : Rp ${(user.saldo ?? 0).toLocaleString('id-ID')}\n`;
+            }
             text += "\n";
 
             // Level & EXP
