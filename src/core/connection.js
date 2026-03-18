@@ -214,13 +214,13 @@ async function connectToWhatsApp() {
         version,
         logger:                         _pinoLogger,
         printQRInTerminal:              !usePairing,
-        connectTimeoutMs:               0,
-        defaultQueryTimeoutMs:          0,
+        connectTimeoutMs:               60_000,       // timeout 60s kalau gagal konek
+        defaultQueryTimeoutMs:          20_000,       // query timeout 20s
         syncFullHistory:                false,
         markOnlineOnConnect:            true,
-        keepAliveIntervalMs:            25_000,
-        retryRequestDelayMs:            3_000,
-        maxMsgRetryCount:               3,
+        keepAliveIntervalMs:            30_000,       // 30s lebih stabil dari 25s
+        retryRequestDelayMs:            5_000,        // retry lebih lambat biar tidak spam
+        maxMsgRetryCount:               5,            // lebih banyak retry sebelum give up
         generateHighQualityLinkPreview: true,
         auth: {
             creds: state.creds,
@@ -434,6 +434,7 @@ async function connectToWhatsApp() {
             const errMsg = lastDisconnect?.error?.message || '';
             logger.warn(`[WA] Disconnect — code: ${code}${errMsg ? ' | ' + errMsg : ''}`);
 
+            if (manzxy._heartbeatTimer) { clearInterval(manzxy._heartbeatTimer); manzxy._heartbeatTimer = null; }
             try { manzxy.ev.removeAllListeners(); } catch {}
             try { manzxy.ws?.close?.(); } catch {}
 
@@ -472,6 +473,27 @@ async function connectToWhatsApp() {
 
             if (!_schedStarted) { _schedStarted = true; startScheduler(manzxy); }
 
+            // heartbeat — cek koneksi setiap 2 menit, reconnect kalau zombie
+            if (manzxy._heartbeatTimer) clearInterval(manzxy._heartbeatTimer);
+            manzxy._heartbeatTimer = setInterval(async () => {
+                if (mySockId !== _sockId) { clearInterval(manzxy._heartbeatTimer); return; }
+                try {
+                    // coba query ringan — kalau timeout berarti koneksi zombie
+                    await Promise.race([
+                        manzxy.fetchStatus(manzxy.user?.id || '').catch(() => {}),
+                        new Promise((_, r) => setTimeout(() => r(new Error('heartbeat timeout')), 10_000)),
+                    ]);
+                } catch (he) {
+                    if (he.message === 'heartbeat timeout') {
+                        logger.warn('[WA] Heartbeat timeout — koneksi zombie, reconnect...');
+                        clearInterval(manzxy._heartbeatTimer);
+                        try { manzxy.ev.removeAllListeners(); } catch {}
+                        try { manzxy.ws?.close?.(); } catch {}
+                        scheduleReconnect(mySockId);
+                    }
+                }
+            }, 2 * 60_000);
+
             // Notif online — hanya sekali per proses
             if (!_notifOnlineSentAt) {
                 _notifOnlineSentAt = Date.now();
@@ -503,8 +525,36 @@ async function connectToWhatsApp() {
 
     manzxy.ev.on('error', e => {
         if (mySockId !== _sockId) return;
-        logger.warn('[WA] Socket error: ' + (e?.message || e));
+        const msg = e?.message || String(e);
+        logger.warn('[WA] Socket error: ' + msg);
+
+        // stream errored / connection reset — langsung reconnect
+        if (
+            msg.includes('stream errored') ||
+            msg.includes('ECONNRESET') ||
+            msg.includes('ECONNREFUSED') ||
+            msg.includes('ETIMEDOUT') ||
+            msg.includes('read ECONNRESET') ||
+            msg.includes('write EPIPE')
+        ) {
+            logger.warn('[WA] Fatal stream error — reconnect...');
+            try { manzxy.ev.removeAllListeners(); } catch {}
+            try { manzxy.ws?.close?.(); } catch {}
+            setTimeout(() => scheduleReconnect(mySockId), 3_000);
+        }
     });
+
+    // WS close tidak selalu trigger connection.update — handle manual
+    try {
+        manzxy.ws?.on('close', (code, reason) => {
+            if (mySockId !== _sockId) return;
+            logger.warn(`[WA] WS closed — code: ${code} | ${reason?.toString?.() || ''}`);
+        });
+        manzxy.ws?.on('error', err => {
+            if (mySockId !== _sockId) return;
+            logger.warn('[WA] WS error: ' + (err?.message || err));
+        });
+    } catch {}
 
     manzxy.ev.on('creds.update', () => {
         if (mySockId !== _sockId) return;
@@ -529,7 +579,7 @@ function _handleMsgError(e, manzxy, mySockId) {
     ) {
         _signalErrCount++;
         const now = Date.now();
-        if (_signalErrCount <= 5 && now - _lastSignalClear > 60_000) {
+        if (_signalErrCount <= 10 && now - _lastSignalClear > 120_000) {
             _lastSignalClear = now;
             logger.warn(`[SESSION] Signal key corrupt #${_signalErrCount} — auto clear & reconnect...`);
             try {
@@ -539,8 +589,8 @@ function _handleMsgError(e, manzxy, mySockId) {
             try { manzxy.ev.removeAllListeners(); } catch {}
             try { manzxy.ws?.close?.(); } catch {}
             setTimeout(() => scheduleReconnect(mySockId), 2_000);
-        } else if (_signalErrCount > 5) {
-            logger.error('[SESSION] Signal error >5x berturut — jalankan .clearkeys dari bot!');
+        } else if (_signalErrCount > 10) {
+            logger.error('[SESSION] Signal error >10x berturut — jalankan .clearkeys dari bot!');
         } else {
             logger.warn('[SESSION] Signal error (throttled):', eMsg.slice(0, 80));
         }
