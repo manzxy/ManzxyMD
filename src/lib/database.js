@@ -26,8 +26,26 @@ const DB_PATH = path.join(DB_DIR, 'bot.db');
 
 if (!fs.existsSync(DB_DIR)) fs.mkdirSync(DB_DIR, { recursive: true });
 
-/* ── Buka koneksi ──────────────────────────────────────────── */
-const db = new BetterSqlite(DB_PATH);
+/* ── Buka koneksi dengan auto-recovery jika corrupt ────────── */
+let db;
+try {
+    db = new BetterSqlite(DB_PATH, { timeout: 10_000 });
+    // Quick check — jika corrupt akan throw SQLITE_NOTADB
+    db.pragma('integrity_check');
+} catch (e) {
+    console.error('[DB] File corrupt atau bukan database, rebuild:', e.message);
+    try {
+        const bak = DB_PATH + '.corrupt.' + Date.now();
+        fs.renameSync(DB_PATH, bak);
+        console.log('[DB] Backup corrupt file ke:', bak);
+    } catch {}
+    // Hapus WAL/SHM juga
+    for (const ext of ['-shm', '-wal']) {
+        try { fs.unlinkSync(DB_PATH + ext); } catch {}
+    }
+    db = new BetterSqlite(DB_PATH, { timeout: 10_000 });
+    console.log('[DB] Database baru dibuat.');
+}
 
 // WAL mode: jauh lebih cepat untuk write-heavy workload
 db.pragma('journal_mode = WAL');
