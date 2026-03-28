@@ -235,13 +235,13 @@ async function startJadiBot(number, method = 'pairing', notifJid = null, ownerIn
         version,
         logger: _pinoLogger,
         printQRInTerminal:              false,
-        connectTimeoutMs:               0,       // jangan potong WA sync
-        defaultQueryTimeoutMs:          0,
+        connectTimeoutMs:               60_000,  // timeout 60s kalau gagal konek
+        defaultQueryTimeoutMs:          20_000,  // query timeout 20s
         syncFullHistory:                false,
         markOnlineOnConnect:            true,
-        keepAliveIntervalMs:            25_000,  // ping WA setiap 25 detik
-        retryRequestDelayMs:            3_000,
-        maxMsgRetryCount:               3,
+        keepAliveIntervalMs:            30_000,  // 30s lebih stabil
+        retryRequestDelayMs:            5_000,   // retry lebih lambat biar tidak spam
+        maxMsgRetryCount:               5,       // lebih banyak retry
         generateHighQualityLinkPreview: false,
         auth: {
             creds: state.creds,
@@ -593,8 +593,20 @@ async function startJadiBot(number, method = 'pairing', notifJid = null, ownerIn
 
     // Tangkap error WS/session yang menyebabkan force close diam-diam
     sock.ev.on('error', (err) => {
-        logger.warn(`[JB] +${number} socket error: ${err?.message || err}`);
-        // Jangan handle di sini — biarkan connection.update yang handle reconnect
+        const _emsg = err?.message || String(err);
+        logger.warn(`[JB] +${number} socket error: ${_emsg}`);
+        // Stream error fatal → paksa close agar connection.update trigger reconnect
+        if (
+            _emsg.includes('stream errored') ||
+            _emsg.includes('ECONNRESET') ||
+            _emsg.includes('ECONNREFUSED') ||
+            _emsg.includes('ETIMEDOUT') ||
+            _emsg.includes('write EPIPE')
+        ) {
+            if (entry._stopped || _stopped.has(number)) return;
+            try { sock.ev.removeAllListeners(); } catch {}
+            try { sock.ws?.close?.(); } catch {}
+        }
     });
 
     sock.ev.on('creds.update', () => {
