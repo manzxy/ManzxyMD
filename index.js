@@ -1,36 +1,27 @@
-/* ============================================================
-   index.js — ManzxyMD Entry Point v7
-
-   File ini HANYA bertanggung jawab:
-     1. Bootstrap: load DB, banner, jadibot engine
-     2. Mulai koneksi WA (via connection.js)
-     3. Pasang process event handlers
-     4. Start cleanup tasks
-
-   Semua logika dipindah ke:
-     src/core/connection.js  — koneksi WA, reconnect, session recovery
-     src/core/scheduler.js   — scheduler grup + adzan
-     src/core/store.js       — in-memory store + LID map
-     src/core/cleanup.js     — session/memory/sewa cleanup
-   ============================================================ */
-
 'use strict';
+/**
+ * index.js — ManzxyMD Entry Point v8
+ * Lebih ringan: tidak ada overhead berat di startup
+ */
 
-const chalk = require('chalk');
-const { config, init } = require('./config.js');
+const chalk  = require('chalk');
 const logger = require('./src/core/logger.js');
+const { config, init } = require('./config.js');
 const db     = require('./src/lib/database.js');
 
 /* ── Load DB ─────────────────────────────────────────────────── */
 db.load();
 
-/* ── Init jadibot engine ─────────────────────────────────────── */
+/* ── Init global map ─────────────────────────────────────────── */
+global._lidToJidMap = global._lidToJidMap || {};
+
+/* ── Load jadibot engine ─────────────────────────────────────── */
 require('./src/lib/jadibot.js');
 
 /* ── Banner ──────────────────────────────────────────────────── */
 function printBanner() {
     console.clear();
-    const w   = 40;
+    const w   = 42;
     const sep = chalk.cyan('╠' + '═'.repeat(w-2) + '╣');
     const ln  = (txt, col) => {
         const pad = Math.max(0, w - 2 - txt.length);
@@ -38,12 +29,13 @@ function printBanner() {
     };
     [
         chalk.cyan('╔' + '═'.repeat(w-2) + '╗'),
-        ln('M A N Z X Y  M D',      chalk.bold.magenta),
-        ln('WhatsApp Bot Framework', chalk.gray),
+        ln('M A N Z X Y  M D',        chalk.bold.magenta),
+        ln('WhatsApp Bot Framework',   chalk.gray),
         sep,
+        ln(`Bot   : ${config.nameBot || 'Bot'}`,  chalk.cyan),
         ln(`Owner : ${config.nameOwn || 'Owner'}`, chalk.cyan),
-        ln(`Bot   : ${config.nameBot || 'Bot'}`,   chalk.cyan),
-        ln(`Versi : ${config.version || '2.0'}`,   chalk.cyan),
+        ln(`Versi : v${config.version || '2.0'}`,  chalk.cyan),
+        ln(`Node  : ${process.version}`,           chalk.gray),
         chalk.cyan('╚' + '═'.repeat(w-2) + '╝'), '',
     ].forEach(l => console.log(l));
 }
@@ -54,8 +46,8 @@ global.restartBot = async (senderJid = null) => {
     try { db.save(); } catch {}
     if (senderJid && global.mainSock) {
         await global.mainSock.sendMessage(senderJid, {
-            text: '🔄 *Bot restart...*\n_Tunggu beberapa detik._'
-        }).catch(()=>{});
+            text: '🔄 *Bot restart...*\n_Tunggu 5–10 detik._'
+        }).catch(() => {});
     }
     const child = spawn(process.execPath, process.argv.slice(1), {
         cwd: process.cwd(), env: process.env, detached: true, stdio: 'inherit',
@@ -67,18 +59,13 @@ global.restartBot = async (senderJid = null) => {
 /* ── Process events ──────────────────────────────────────────── */
 process.on('uncaughtException', e => {
     logger.error('[UNCAUGHT] ' + (e?.message || e));
-    // Jangan exit — bot harus tetap jalan
+    // Tidak exit — bot harus tetap jalan
 });
 process.on('unhandledRejection', r => {
     logger.warn('[UNHANDLED] ' + (r?.message || r));
 });
-const _exit = sig => {
-    console.log(chalk.yellow(`\n[EXIT] ${sig}`));
-    try { db.save(); } catch {}
-    process.exit(0);
-};
-process.on('SIGINT',  () => _exit('SIGINT'));
-process.on('SIGTERM', () => _exit('SIGTERM'));
+process.on('SIGINT',  () => { try { db.save(); } catch {} process.exit(0); });
+process.on('SIGTERM', () => { try { db.save(); } catch {} process.exit(0); });
 
 /* ── Start ───────────────────────────────────────────────────── */
 printBanner();
@@ -89,6 +76,6 @@ const { startCleanupTasks }                    = require('./src/core/cleanup.js'
 startCleanupTasks();
 
 connectToWhatsApp().catch(e => {
-    console.error(chalk.red('[START]'), e.message);
+    logger.error('[START] ' + e.message);
     scheduleReconnect(0);
 });
