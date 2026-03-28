@@ -549,6 +549,25 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
             }
         }
 
+        /* NON-PREFIX SESSION INTERCEPTOR
+         * Tangkap input tanpa prefix untuk plugin yang butuh state/session
+         */
+        if (!m.fromMe && !CMD) {
+            const _sessionPlugins = ['./src/plugins/cjs/tools-snippet.js'];
+            for (const _sp of _sessionPlugins) {
+                try {
+                    const _mod = require(_sp);
+                    if (typeof _mod._handleSession === 'function') {
+                        const _handled = await _mod._handleSession(
+                            senderJid, m.body || '',
+                            (teks) => manzxy.sendMessage(m.chat, { text: teks }, { quoted: m })
+                        );
+                        if (_handled) return;
+                    }
+                } catch {}
+            }
+        }
+
         /* REPLY FUNCTION */
         const reply = (teks) =>
             manzxy.sendMessage(m.chat, { text: teks }, { quoted: m });
