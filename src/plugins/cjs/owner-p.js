@@ -1,22 +1,11 @@
 /**
- * owner-p.js — Plugin Manager CJS & ESM (unified)
- *
- * ─ FITUR ─────────────────────────────────────────────────────
- *  • .plugin list [cjs|esm]     — lihat semua plugin
- *  • .plugin + <nama> [cjs|esm] — tambah/timpa plugin (reply kode)
- *  • .plugin - <nomor> [cjs|esm]— hapus plugin
- *  • .plugin ? <nomor> [cjs|esm]— lihat isi plugin
- *  • .plugin reload             — paksa reload cache
- *
- * ─ AUTO STRUKTUR ─────────────────────────────────────────────
- *  Saat .plugin + :
- *  1. Deteksi otomatis apakah kode CJS atau ESM dari isinya
- *  2. Wrap kode jika belum punya struktur yang benar:
- *     - CJS: tambah module.exports + handler.command jika belum ada
- *     - ESM: tambah export default + .command jika belum ada
- *  3. Jika file sudah ada → TIMPA (overwrite)
- *  4. Force invalidate cache agar langsung aktif
+ * owner-p.js — Plugin Manager CJS & ESM (UNLIMITED VERSION)
+ * ✔ TANPA BATAS PREVIEW (full isi file)
+ * ✔ Auto wrap CJS & ESM
+ * ✔ Auto detect type
+ * ✔ Force reload cache
  */
+
 'use strict';
 
 const fs   = require('fs');
@@ -25,7 +14,7 @@ const path = require('path');
 const CJS_DIR = path.join(__dirname);
 const ESM_DIR = path.join(__dirname, '../esm');
 
-/* ── List files ─────────────────────────────────────────── */
+/* ── LIST ───────────────────────────────────────────── */
 const listCjs = () =>
     fs.existsSync(CJS_DIR)
         ? fs.readdirSync(CJS_DIR).filter(f => f.endsWith('.js') && f !== 'owner-p.js').sort()
@@ -36,318 +25,189 @@ const listEsm = () =>
         ? fs.readdirSync(ESM_DIR).filter(f => f.endsWith('.mjs') || (f.endsWith('.js') && f !== 'owner-p.js')).sort()
         : [];
 
-/* ── Deteksi tipe dari isi kode ─────────────────────────── */
+/* ── DETECT TYPE ───────────────────────────────────── */
 const detectType = (code) => {
-    // ESM: ada import/export syntax
-    if (/^\s*(import\s|export\s(default|const|function|async))/m.test(code)) return 'esm';
-    // Eksplisit CJS
-    if (/module\.exports\s*=|exports\./m.test(code)) return 'cjs';
-    // Default ke CJS
+    if (/^\s*(import\s|export\s)/m.test(code)) return 'esm';
+    if (/module\.exports|exports\./m.test(code)) return 'cjs';
     return 'cjs';
 };
 
-/* ── Ekstrak nama command dari kode ─────────────────────── */
+/* ── EXTRACT COMMAND ───────────────────────────────── */
 const extractCommand = (code) => {
-    // handler.command = ['xxx'] atau handler.command = 'xxx'
-    const m = code.match(/handler\.command\s*=\s*(?:\[['"]([^'"]+)['"]|\s*['"]([^'"]+)['"]\]?)/);
-    if (m) return m[1] || m[2];
-    // export.command = ...
-    const m2 = code.match(/\w+\.command\s*=\s*\[?['"]([^'"]+)['"]/);
-    if (m2) return m2[1];
-    return null;
+    const m = code.match(/\.command\s*=\s*\[?['"]([^'"]+)['"]/);
+    return m ? m[1] : null;
 };
 
-/* ── Auto-wrap kode CJS ──────────────────────────────────── */
+/* ── WRAP CJS ─────────────────────────────────────── */
 const wrapCjs = (code, filename) => {
-    // Sudah punya struktur lengkap
-    if (/module\.exports\s*=/.test(code) && /handler\.command\s*=/.test(code)) return code;
+    if (/module\.exports/.test(code) && /handler\.command/.test(code)) return code;
 
-    const cmdName = filename.replace('.js', '').replace(/[^a-z0-9]/gi, '');
+    const cmd = filename.replace('.js', '').replace(/[^a-z0-9]/gi, '');
 
-    // Punya handler tapi belum module.exports
     if (/const handler\s*=/.test(code) && !/module\.exports/.test(code)) {
-        return code.trimEnd() + `\n\nif (!handler.command) handler.command = ['${cmdName}'];\nif (!handler.tags) handler.tags = ['misc'];\nmodule.exports = handler;\n`;
-handler.limit    = false;
+        return code + `
+
+handler.command = handler.command || ['${cmd}'];
+handler.tags    = handler.tags || ['misc'];
+handler.limit   = false;
+
+module.exports = handler;
+`;
     }
 
-    // Kode polos (fungsi/logika biasa) — wrap jadi handler
     return `'use strict';
 
-const handler = async (m, { manzxy, args, reply, text, command, isOwn, isPrem, senderJid, from }) => {
-${code.split('\n').map(l => '    ' + l).join('\n')}
+const handler = async (m, { reply, args, text, command }) => {
+${code.split('\n').map(v => '  ' + v).join('\n')}
 };
 
-handler.command  = ['${cmdName}'];
-handler.tags     = ['misc'];
-handler.fitur    = { '${cmdName}': 'Plugin ${cmdName}' };
+handler.command = ['${cmd}'];
+handler.tags    = ['misc'];
+handler.limit   = false;
+handler.fitur   = { '${cmd}': 'Plugin ${cmd}' };
+
 module.exports = handler;
 `;
 };
 
-/* ── Auto-wrap kode ESM ──────────────────────────────────── */
+/* ── WRAP ESM ─────────────────────────────────────── */
 const wrapEsm = (code, filename) => {
-    const cmdName = filename.replace(/\.(mjs|js)$/, '').replace(/[^a-z0-9]/gi, '');
+    const cmd = filename.replace(/\.(mjs|js)/, '').replace(/[^a-z0-9]/gi, '');
 
-    // Sudah lengkap (punya export default function + .command)
-    if (/export\s+default\s+/.test(code) && /\.command\s*=/.test(code)) return code;
+    if (/export default/.test(code) && /\.command/.test(code)) return code;
 
-    // Punya export default tapi belum .command — tambahkan
-    if (/export\s+default\s+(?:async\s+)?function\s+(\w+)/.test(code)) {
-        const fnName = code.match(/export\s+default\s+(?:async\s+)?function\s+(\w+)/)[1];
-        if (!/\.command\s*=/.test(code)) {
-            return code.trimEnd() + `\n\n${fnName}.command = ['${cmdName}'];\n${fnName}.tags    = ['misc'];\n${fnName}.fitur   = { '${cmdName}': 'Plugin ${cmdName}' };\n`;
-        }
-        return code;
-    }
-
-    // Kode polos — wrap jadi ESM handler
-    return `import { createRequire } from 'module';
-const require = createRequire(import.meta.url);
-
-export default async function ${cmdName}(m, { manzxy, args, reply, text, command, isOwn, isPrem, senderJid, from }) {
-${code.split('\n').map(l => '    ' + l).join('\n')}
+    return `export default async function ${cmd}(m, { reply, args, text, command }) {
+${code.split('\n').map(v => '  ' + v).join('\n')}
 }
 
-${cmdName}.command = ['${cmdName}'];
-${cmdName}.tags    = ['misc'];
-${cmdName}.fitur   = { '${cmdName}': 'Plugin ${cmdName}' };
+${cmd}.command = ['${cmd}'];
+${cmd}.tags    = ['misc'];
+${cmd}.limit   = false;
+${cmd}.fitur   = { '${cmd}': 'Plugin ${cmd}' };
 `;
 };
 
-/* ── Force invalidate semua cache plugin ─────────────────── */
-const invalidateAllCaches = () => {
-    // CJS: gunakan forceReload() yang langsung rebuild cache
+/* ── INVALIDATE CACHE ─────────────────────────────── */
+const reloadAll = () => {
     try {
         const handlerMod = require('../../lib/handler.js');
-        if (typeof handlerMod.forceReload === 'function') {
-            handlerMod.forceReload();
-        } else {
-            // fallback: hapus require cache semua plugin
-            for (const f of listCjs()) {
-                try { delete require.cache[require.resolve(path.join(CJS_DIR, f))]; } catch {}
-            }
-        }
+        handlerMod.forceReload?.();
     } catch {}
 
-    // ESM & allPlugins cache — reset via global flag
-    try {
-        if (global._resetPluginCache) global._resetPluginCache();
-    } catch {}
+    for (const f of listCjs()) {
+        try { delete require.cache[require.resolve(path.join(CJS_DIR, f))]; } catch {}
+    }
+
+    global._resetPluginCache?.();
 };
 
-/* ═══════════════════════════════════════════════════════════
-   HANDLER
-   ═══════════════════════════════════════════════════════════ */
-const handler = async (m, { args, reply, isOwn }) => {
-    if (!isOwn) return reply('⛔ Owner only!');
+/* ═══════════════════════════════════════════════════ */
 
-    // Parse: .plugin <sub> [arg1] [arg2]
-    // sub bisa: list, +, -, ?, reload
-    // tipe bisa: cjs, esm (default: auto)
+const handler = async (m, { args, reply, isOwn }) => {
+    if (!isOwn) return reply('⛔ Owner only');
+
     const sub  = (args[0] || '').toLowerCase();
-    const arg1 = args[1] || '';
+    const arg1 = args[1];
     const arg2 = (args[2] || '').toLowerCase();
 
-    /* ── TANPA ARGUMEN ── */
+    /* MENU */
     if (!sub) {
-        const cjsN = listCjs().length;
-        const esmN = listEsm().length;
+        return reply(`📦 Plugin Manager
+
+• .plugin list
+• .plugin + nama.js
+• .plugin - nomor
+• .plugin ? nomor
+• .plugin reload
+
+Auto wrap aktif`);
+    }
+
+    /* LIST */
+    if (sub === 'list') {
+        const cjs = listCjs();
+        const esm = listEsm();
+
         return reply(
-            `📦 *Plugin Manager*\n` +
-            `CJS: *${cjsN} plugin* | ESM: *${esmN} plugin*\n\n` +
-            `*Commands:*\n` +
-            `• *.plugin list* — semua plugin\n` +
-            `• *.plugin list cjs* — plugin CJS saja\n` +
-            `• *.plugin list esm* — plugin ESM saja\n\n` +
-            `• *.plugin + nama.js* — tambah/timpa CJS (reply kode)\n` +
-            `• *.plugin + nama.mjs esm* — tambah/timpa ESM\n` +
-            `• *.plugin + nama.js cjs* — force CJS\n\n` +
-            `• *.plugin - <nomor>* — hapus CJS\n` +
-            `• *.plugin - <nomor> esm* — hapus ESM\n\n` +
-            `• *.plugin ? <nomor>* — lihat isi CJS\n` +
-            `• *.plugin ? <nomor> esm* — lihat isi ESM\n\n` +
-            `• *.plugin reload* — force reload cache\n\n` +
-            `💡 *Auto-struktur aktif:* kode akan otomatis\n` +
-            `   dibungkus struktur CJS/ESM yang benar.`
+`📁 CJS (${cjs.length})
+${cjs.map((v,i)=>`${i+1}. ${v}`).join('\n') || 'kosong'}
+
+📁 ESM (${esm.length})
+${esm.map((v,i)=>`${i+1}. ${v}`).join('\n') || 'kosong'}`
         );
     }
 
-    /* ── LIST ── */
-    if (sub === 'list' || sub === 'ls') {
-        const showCjs = arg1 !== 'esm';
-        const showEsm = arg1 !== 'cjs';
-        let text = '';
-
-        if (showCjs) {
-            const files = listCjs();
-            text += `📁 *Plugin CJS* (${files.length})\n`;
-            if (files.length) files.forEach((f, i) => { text += `  ${i + 1}. ${f}\n`; });
-            else text += `  _kosong_\n`;
-            text += '\n';
-        }
-        if (showEsm) {
-            const files = listEsm();
-            text += `📁 *Plugin ESM* (${files.length})\n`;
-            if (files.length) files.forEach((f, i) => { text += `  ${i + 1}. ${f}\n`; });
-            else text += `  _kosong_\n`;
-        }
-        return reply(text.trim());
-    }
-
-    /* ── RELOAD ── */
+    /* RELOAD */
     if (sub === 'reload') {
-        invalidateAllCaches();
-        return reply('🔄 Cache plugin di-reset!\n\nPlugin akan reload otomatis pada pesan berikutnya.');
+        reloadAll();
+        return reply('✅ Reload sukses');
     }
 
-    /* ── TAMBAH / TIMPA ── */
+    /* TAMBAH */
     if (sub === '+') {
-        if (!m.quoted?.text) {
-            return reply(
-                `❌ *Reply ke pesan yang berisi kode plugin!*\n\n` +
-                `Format: *.plugin + <nama.js>*\n\n` +
-                `Contoh:\n` +
-                `• *.plugin + hello.js* — tambah/timpa CJS\n` +
-                `• *.plugin + hello.mjs esm* — tambah/timpa ESM\n\n` +
-                `💡 Kode tidak perlu punya struktur lengkap —\n` +
-                `   bot akan otomatis menyesuaikan!`
-            );
-        }
+        if (!m.quoted?.text) return reply('Reply kode dulu');
+        if (!arg1) return reply('Nama file?');
 
-        if (!arg1) {
-            return reply(`❌ Sertakan nama file!\nContoh: *.plugin + hello.js*`);
-        }
+        const code = m.quoted.text;
+        const type = arg2 || detectType(code);
 
-        const rawCode  = m.quoted.text;
-        const fileName = arg1;
+        let file = arg1;
+        let dir, final;
 
-        // Tentukan tipe: dari arg2, atau dari ekstensi file, atau dari isi kode
-        let tipe;
-        if (arg2 === 'esm' || fileName.endsWith('.mjs')) tipe = 'esm';
-        else if (arg2 === 'cjs' || fileName.endsWith('.js')) tipe = 'cjs';
-        else tipe = detectType(rawCode);
-
-        let finalName = fileName;
-        let targetDir;
-        let wrappedCode;
-
-        if (tipe === 'esm') {
-            if (!finalName.endsWith('.mjs') && !finalName.endsWith('.js')) finalName += '.mjs';
-            if (!fs.existsSync(ESM_DIR)) fs.mkdirSync(ESM_DIR, { recursive: true });
-            targetDir   = ESM_DIR;
-            wrappedCode = wrapEsm(rawCode, finalName);
+        if (type === 'esm') {
+            if (!file.endsWith('.mjs')) file += '.mjs';
+            dir   = ESM_DIR;
+            final = wrapEsm(code, file);
         } else {
-            if (!finalName.endsWith('.js')) finalName += '.js';
-            targetDir   = CJS_DIR;
-            wrappedCode = wrapCjs(rawCode, finalName);
+            if (!file.endsWith('.js')) file += '.js';
+            dir   = CJS_DIR;
+            final = wrapCjs(code, file);
         }
 
-        const targetPath = path.join(targetDir, finalName);
-        const isOverwrite = fs.existsSync(targetPath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-        // Validasi syntax kode yang sudah di-wrap (hanya untuk CJS)
-        if (tipe === 'cjs') {
-            try {
-                new Function(wrappedCode);
-            } catch (e) {
-                return reply(
-                    `❌ *Kode tidak valid!*\n\n` +
-                    `Error: _${e.message}_\n\n` +
-                    `Periksa kembali kode kamu.`
-                );
-            }
-        }
+        const target = path.join(dir, file);
+        fs.writeFileSync(target, final);
 
-        // Tulis file (overwrite jika sudah ada)
-        fs.writeFileSync(targetPath, wrappedCode, 'utf8');
+        reloadAll();
 
-        // Invalidate cache agar langsung aktif
-        if (tipe === 'cjs') {
-            try { delete require.cache[require.resolve(targetPath)]; } catch {}
-        }
-        invalidateAllCaches();
-
-        const cmdDetected = extractCommand(wrappedCode);
-        return reply(
-            `${isOverwrite ? '🔄 *Plugin diperbarui (overwrite)!*' : '✅ *Plugin berhasil ditambahkan!*'}\n\n` +
-            `📁 Tipe   : *${tipe.toUpperCase()}*\n` +
-            `📄 File   : *${finalName}*\n` +
-            `📦 Size   : ${(Buffer.byteLength(wrappedCode) / 1024).toFixed(1)} KB\n` +
-            (cmdDetected ? `🔑 Command: *.${cmdDetected}*\n` : '') +
-            `\n_Auto-struktur diterapkan. Plugin langsung aktif!_`
-        );
+        return reply(`✅ Plugin masuk
+📄 ${file}
+⚙️ ${type}`);
     }
 
-    /* ── HAPUS ── */
+    /* HAPUS */
     if (sub === '-') {
-        if (!arg1) return reply(`Usage: *.plugin - <nomor> [cjs|esm]*`);
+        const idx = parseInt(arg1) - 1;
+        const files = listCjs();
 
-        const isCjs  = arg2 !== 'esm';
-        const files  = isCjs ? listCjs() : listEsm();
-        const dir    = isCjs ? CJS_DIR : ESM_DIR;
-        const idx    = parseInt(arg1) - 1;
+        if (!files[idx]) return reply('Nomor salah');
 
-        if (isNaN(idx) || idx < 0 || idx >= files.length) {
-            return reply(`❌ Nomor tidak valid! (1-${files.length})`);
-        }
+        fs.unlinkSync(path.join(CJS_DIR, files[idx]));
+        reloadAll();
 
-        const fileName = files[idx];
-        const filePath = path.join(dir, fileName);
-
-        // Safety: jangan hapus plugin manager sendiri
-        if (fileName === 'owner-p.js' || fileName === 'owner-p.mjs') {
-            return reply('⛔ Tidak bisa menghapus Plugin Manager!');
-        }
-
-        if (isCjs) {
-            try { delete require.cache[require.resolve(filePath)]; } catch {}
-        }
-        fs.unlinkSync(filePath);
-        invalidateAllCaches();
-
-        return reply(`🗑️ Plugin *${fileName}* dihapus!\n_Tipe: ${isCjs ? 'CJS' : 'ESM'}_`);
+        return reply(`🗑️ ${files[idx]} dihapus`);
     }
 
-    /* ── LIHAT ISI ── */
+    /* LIHAT (UNLIMITED) */
     if (sub === '?') {
-        if (!arg1) return reply(`Usage: *.plugin ? <nomor> [cjs|esm]*`);
+        const idx = parseInt(arg1) - 1;
+        const files = listCjs();
 
-        const isCjs = arg2 !== 'esm';
-        const files = isCjs ? listCjs() : listEsm();
-        const dir   = isCjs ? CJS_DIR : ESM_DIR;
-        const idx   = parseInt(arg1) - 1;
+        if (!files[idx]) return reply('Nomor salah');
 
-        if (isNaN(idx) || idx < 0 || idx >= files.length) {
-            return reply(`❌ Nomor tidak valid! (1-${files.length})`);
-        }
+        const content = fs.readFileSync(path.join(CJS_DIR, files[idx]), 'utf8');
 
-        const fileName = files[idx];
-        let content;
-        try {
-            content = fs.readFileSync(path.join(dir, fileName), 'utf8');
-        } catch (e) {
-            return reply(`❌ Gagal baca file: ${e.message}`);
-        }
-        const preview  = content.length > 3000
-            ? content.substring(0, 3000) + '\n\n...(truncated, total ' + content.length + ' chars)'
-            : content;
+        // 🔥 TANPA LIMIT — FULL TEXT
+        return reply(`📄 ${files[idx]}
 
-        return reply(`📄 *${fileName}* [${isCjs ? 'CJS' : 'ESM'}]\n\n${preview}`);
+${content}`);
     }
 
-    return reply(
-        `❓ Subcommand tidak dikenal: *${sub}*\n\n` +
-        `Tersedia: *list / + / - / ? / reload*\n` +
-        `Ketik *.plugin* untuk info lengkap.`
-    );
+    reply('❓ command tidak dikenal');
 };
 
-handler.command  = ['plugin', 'plugins'];
-handler.tags     = ['owner'];
-handler.owner    = true;
-handler.mainOnly = true;
-handler.fitur    = {
-    'plugin':  'Kelola plugin CJS & ESM (auto-struktur)',
-    'plugins': 'Kelola plugin CJS & ESM (auto-struktur)',
-};
+handler.command = ['plugin'];
+handler.owner   = true;
+
 module.exports = handler;
