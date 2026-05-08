@@ -47,13 +47,16 @@ try {
     console.log('[DB] Database baru dibuat.');
 }
 
-// WAL mode: jauh lebih cepat untuk write-heavy workload
+// WAL mode — optimal untuk banyak writer concurrent (banyak grup)
 db.pragma('journal_mode = WAL');
-db.pragma('synchronous  = NORMAL');
+db.pragma('synchronous  = NORMAL');   // cukup aman, jauh lebih cepat dari FULL
 db.pragma('foreign_keys = ON');
-db.pragma('cache_size   = -8192');  // 8 MB cache — cukup untuk low-spec
-db.pragma('temp_store   = MEMORY');  // temp table di RAM, bukan disk
-db.pragma('mmap_size    = 16777216'); // 16 MB mmap
+db.pragma('cache_size   = -16384');   // 16 MB cache — lebih besar untuk banyak grup
+db.pragma('temp_store   = MEMORY');
+db.pragma('mmap_size    = 33554432'); // 32 MB mmap — baca lebih cepat
+db.pragma('wal_autocheckpoint = 400'); // checkpoint lebih sering, WAL tidak bloat
+db.pragma('busy_timeout = 10000');    // tunggu 10s jika DB dikunci sebelum error
+db.pragma('page_size    = 4096');     // default, optimal untuk SSD & ext4
 
 /* ── Skema Tabel ───────────────────────────────────────────── */
 db.exec(`
@@ -112,12 +115,39 @@ db.exec(`
         value           INTEGER NOT NULL
     );
 
+    -- Chat stats per grup
+    CREATE TABLE IF NOT EXISTS chat_stats (
+        group_jid   TEXT NOT NULL,
+        user_jid    TEXT NOT NULL,
+        count       INTEGER NOT NULL DEFAULT 0,
+        last_chat   INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (group_jid, user_jid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_stats_group ON chat_stats(group_jid, count DESC);
+
     -- Channel followers (user yang sudah verifikasi follow channel)
     CREATE TABLE IF NOT EXISTS channel_followers (
         number          TEXT PRIMARY KEY,
         verified_at     INTEGER NOT NULL DEFAULT 0
     );
+
+    -- Rate limit per-JID (anti-spam / anti-ban per user)
+    CREATE TABLE IF NOT EXISTS rate_limits (
+        jid             TEXT PRIMARY KEY,
+        count           INTEGER NOT NULL DEFAULT 0,
+        window_start    INTEGER NOT NULL DEFAULT 0
+    );
 `);
+
+// Indeks tambahan — mempercepat query untuk bot dengan banyak grup
+try {
+    db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_users_jid    ON users(jid);
+        CREATE INDEX IF NOT EXISTS idx_groups_jid   ON groups(jid);
+        CREATE INDEX IF NOT EXISTS idx_premium_num  ON premium(number, expired_at);
+        CREATE INDEX IF NOT EXISTS idx_rate_jid     ON rate_limits(jid, window_start);
+    `);
+} catch {}
 
 /* ── Default settings ──────────────────────────────────────── */
 const _setDefault = db.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)`);
@@ -791,6 +821,65 @@ function sewaPendingDel(senderJid) {
     setSetting(key, null);
 }
 
+/* ── Chat Stats ─────────────────────────────────────────── */
+const _chatStatsAdd = db.prepare(`
+    INSERT INTO chat_stats (group_jid, user_jid, count, last_chat)
+    VALUES (?, ?, 1, ?)
+    ON CONFLICT(group_jid, user_jid) DO UPDATE
+    SET count = count + 1, last_chat = excluded.last_chat
+`);
+const _chatStatsTop = db.prepare(`
+    SELECT user_jid, count FROM chat_stats
+    WHERE group_jid = ?
+    ORDER BY count DESC LIMIT ?
+`);
+const _chatStatsGet = db.prepare(`
+    SELECT count FROM chat_stats WHERE group_jid = ? AND user_jid = ?
+`);
+const _chatStatsReset = db.prepare(`DELETE FROM chat_stats WHERE group_jid = ?`);
+const _chatStatsTotal = db.prepare(`SELECT SUM(count) as total FROM chat_stats WHERE group_jid = ?`);
+
+function addChat(groupJid, userJid) {
+    try { _chatStatsAdd.run(groupJid, userJid, Date.now()); } catch {}
+}
+function getTopChatters(groupJid, limit = 3) {
+    try { return _chatStatsTop.all(groupJid, limit); } catch { return []; }
+}
+function getChatCount(groupJid, userJid) {
+    try { return _chatStatsGet.get(groupJid, userJid)?.count || 0; } catch { return 0; }
+}
+function resetChatStats(groupJid) {
+    try { _chatStatsReset.run(groupJid); return true; } catch { return false; }
+}
+function getTotalChats(groupJid) {
+    try { return _chatStatsTotal.get(groupJid)?.total || 0; } catch { return 0; }
+}
+
+/* ── Rate Limit (anti-spam per user, 10 cmd / 10 detik) ──────── */
+const _rlStmt = {
+    get: db.prepare('SELECT count, window_start FROM rate_limits WHERE jid = ?'),
+    set: db.prepare('INSERT OR REPLACE INTO rate_limits (jid, count, window_start) VALUES (?, ?, ?)'),
+};
+
+function checkRateLimit(jid, maxCmds = 10, windowMs = 10_000) {
+    try {
+        const now  = Date.now();
+        const row  = _rlStmt.get.get(jid);
+        if (!row || now - row.window_start > windowMs) {
+            _rlStmt.set.run(jid, 1, now);
+            return true; // OK
+        }
+        if (row.count >= maxCmds) return false; // rate limit hit
+        _rlStmt.set.run(jid, row.count + 1, row.window_start);
+        return true;
+    } catch { return true; } // jika DB error, loloskan saja
+}
+
+// Bersihkan rate_limits lama tiap 10 menit (hindari bloat)
+setInterval(() => {
+    try { db.prepare('DELETE FROM rate_limits WHERE window_start < ?').run(Date.now() - 60_000); } catch {}
+}, 10 * 60_000);
+
 module.exports = {
     // Core lifecycle
     load,
@@ -807,6 +896,7 @@ module.exports = {
     saveGroup,
 
     // Owner
+    addChat, getTopChatters, getChatCount, resetChatStats, getTotalChats,
     getOwners,
     addOwner,
     delOwner,
