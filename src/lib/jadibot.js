@@ -231,18 +231,45 @@ async function startJadiBot(number, method = 'pairing', notifJid = null, ownerIn
 
     logger.jb(`[JB] +${number} menghubungkan ke WA...`);
 
+    // Store dibuat SEBELUM makeWASocket agar getMessage bisa referensinya
+    const subStore = makeStore();
+
     const sock = makeWASocket({
         version,
         logger: _pinoLogger,
         printQRInTerminal:              false,
-        connectTimeoutMs:               60_000,  // timeout 60s kalau gagal konek
-        defaultQueryTimeoutMs:          20_000,  // query timeout 20s
+        browser:                        ['Ubuntu', 'Chrome', '20.0.04'],
+        connectTimeoutMs:               45_000,
+        defaultQueryTimeoutMs:          15_000,
         syncFullHistory:                false,
-        markOnlineOnConnect:            true,
-        keepAliveIntervalMs:            30_000,  // 30s lebih stabil
-        retryRequestDelayMs:            5_000,   // retry lebih lambat biar tidak spam
-        maxMsgRetryCount:               5,       // lebih banyak retry
+        markOnlineOnConnect:            false,  // hemat — jadibot tidak perlu broadcast online
+        keepAliveIntervalMs:            30_000,
+        retryRequestDelayMs:            2_000,
+        maxMsgRetryCount:               3,
         generateHighQualityLinkPreview: false,
+        getMessage: async (key) => {
+            // Coba ambil dari store dulu
+            const jid = key.remoteJid;
+            if (jid && subStore.messages[jid]) {
+                const found = subStore.messages[jid].find(m => m.key?.id === key.id);
+                if (found?.message) return found.message;
+            }
+            return { conversation: '' };
+        },
+        patchMessageBeforeSending: msg => {
+            const hasMsgType =
+                msg.buttonsMessage     ||
+                msg.listMessage        ||
+                msg.templateMessage    ||
+                msg.interactiveMessage;
+            if (hasMsgType) {
+                msg.messageContextInfo = {
+                    deviceListMetadata:        {},
+                    deviceListMetadataVersion: 2,
+                };
+            }
+            return msg;
+        },
         auth: {
             creds: state.creds,
             keys:  makeCacheableSignalKeyStore(state.keys, _pinoLogger),
@@ -262,7 +289,6 @@ async function startJadiBot(number, method = 'pairing', notifJid = null, ownerIn
         return jid;
     };
 
-    const subStore = makeStore();
     subStore.bind(sock.ev);
 
     const entry = {
@@ -403,6 +429,24 @@ async function startJadiBot(number, method = 'pairing', notifJid = null, ownerIn
             // Reset reconnect counter
             _reconnectNums.delete(number);
 
+            // Restore public=true setiap open (jadibot selalu public)
+            sock.public = true;
+
+            // Anti-ban: throttle sendMessage jadibot jika config.antiBan aktif
+            const { config: _cfg } = require('../../config.js');
+            if (_cfg.antiBan && !sock._antiBanWrapped) {
+                sock._antiBanWrapped = true;
+                const _orig = sock.sendMessage.bind(sock);
+                let _lastAt = 0;
+                sock.sendMessage = async (...a) => {
+                    const d = _cfg.antiBanDelay || 800;
+                    const wait = d - (Date.now() - _lastAt);
+                    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+                    _lastAt = Date.now();
+                    return _orig(...a);
+                };
+            }
+
             let active = global.jadiBotSockets.get(number);
             if (!active) { global.jadiBotSockets.set(number, entry); active = entry; }
 
@@ -542,7 +586,9 @@ async function startJadiBot(number, method = 'pairing', notifJid = null, ownerIn
             const attempts = (_reconnectNums.get(number) || 0) + 1;
             _reconnectNums.set(number, attempts);
 
-            const MAX = 15;
+            // FIX: turunkan MAX ke 10 — gagal 10x berturut cukup jadi tanda sesi mati
+            // Jangan terus retry tanpa henti karena membebani server
+            const MAX = 10;
             if (attempts > MAX) {
                 clearLoginTimer(number);
                 _reconnectNums.delete(number);
@@ -568,9 +614,11 @@ async function startJadiBot(number, method = 'pairing', notifJid = null, ownerIn
             }
 
             // 515 = WA server restart → delay lebih lama
+            
+            // FIX: exponential backoff — lebih konservatif, tidak spam WA server
             const delay = dcType === 'restart'
-                ? Math.min(15_000 * attempts, 60_000)
-                : Math.min(3_000  * attempts, 30_000);
+                ? Math.min(10_000 * Math.pow(1.5, Math.min(attempts - 1, 7)), 90_000)
+                : Math.min(5_000  * Math.pow(1.5, Math.min(attempts - 1, 7)), 60_000);
 
             logger.warn(`[JB] +${number} reconnect #${attempts} in ${(delay/1000).toFixed(1)}s`);
 
