@@ -18,7 +18,7 @@ const logger = require('../core/logger.js');
 let _plugins  = [];
 let _mtimes   = {};
 let _lastScan = 0;
-const SCAN_INTERVAL = 5_000; // sync dengan CJS handler
+const SCAN_INTERVAL = 60_000; // selaraskan dengan handler.js
 
 const _needsReload = () => {
     if (!_plugins.length) return true;
