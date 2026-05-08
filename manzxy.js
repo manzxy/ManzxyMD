@@ -12,6 +12,9 @@ const axios  = require('axios');
 const crypto = require('crypto');
 const moment = require('moment-timezone');
 const { spawn, exec } = require('child_process');
+const { forceJid: _forceJid } = require('./src/lib/jid-utils.js');
+const _antilinkMod  = require('./src/plugins/cjs/group-antilink.js');
+const _antilinkGcMod = require('./src/plugins/cjs/group-antilinkgc.js');
 // Logger: require dulu, fallback ke global._logger
 let logger;
 try {
@@ -40,7 +43,12 @@ const {
    ============================================================ */
 // system.js (Case) tidak dipakai - dihapus
 const _db  = require("./src/lib/database.js");
-if (typeof _db.load === 'function') _db.load(); // idempoten — aman dipanggil berulang
+
+// Init mode dari config.selfMode (hanya sekali)
+if (global._botPublic === undefined) {
+    global._botPublic = !config.selfMode;
+}
+if (typeof _db.load === 'function') _db.load();
 
 const getUser  = (jid) => { try { return _db.getUser(jid);  } catch { return { banned: false, limit: 20, warn: {}, premium: false, registered: false }; } };
 const getGroup = (jid) => { try { return _db.getGroup(jid); } catch { return { adminonly: false, warns: {}, antilinkWarn: {}, mute: false }; } };
@@ -59,8 +67,8 @@ _loadOwner();
 _loadPremium();
 // Global invalidator — bisa dipanggil dari plugin setelah addprem/delprem
 global._invalidatePremCache = () => { _loadOwner(); _loadPremium(); };
-// Refresh setiap 5 detik (menggantikan fs.watchFile)
-setInterval(() => { _loadOwner(); _loadPremium(); }, 30_000); // refresh tiap 30s
+// Refresh cache owner & premium tiap 60s
+setInterval(() => { _loadOwner(); _loadPremium(); }, 60_000);
 
 /* ============================================================
    PLUGIN CACHE
@@ -148,13 +156,6 @@ const execWithTimeout = (cmd, timeout = 15000) => {
     });
 };
 
-/* ============================================================
-   PLUGIN LIMIT CACHE
-   Di-cache 60 detik, scan CJS & ESM sekaligus
-   ============================================================ */
-let _pluginLimitCache   = null;
-let _pluginLimitCacheTs = 0;
-
 /**
  * Scan & cache semua plugin (CJS + ESM)
  * Return array of plugin objects dengan .limit, .limitCost, .command, .mainOnly
@@ -164,7 +165,7 @@ let _pluginLimitCacheTs = 0;
  */
 let _allPluginsCache = null;
 let _allPluginsCacheTs = 0;
-const ALL_PLUGINS_TTL = 30_000;
+const ALL_PLUGINS_TTL = 60_000; // selaraskan dengan handler.js scan interval
 
 // Exposed untuk plugin manager — reset cache setelah tambah/hapus plugin
 global._resetPluginCache = () => {
@@ -238,9 +239,6 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
             const num = (jid.split('@')[0]).split(':')[0].replace(/[^0-9]/g, '');
             return num ? num + '@s.whatsapp.net' : null;
         };
-
-        // isLid — via jid-utils (centralized)
-        const { forceJid: _forceJid } = require('./src/lib/jid-utils.js');
 
         const getCorrectSender = (m) => {
             // FIX: di PV, sender SELALU = remoteJid (bukan bot ID)
@@ -336,15 +334,16 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
         // Apakah ini jadibot? (bukan bot utama)
         const _isJadiBot = !!manzxy._jadibotOwner;
 
-        // isBotSelf: pesan dari nomor bot itu sendiri
-        // Bisa akses semua fitur biasa, tapi TIDAK bisa owner-only & eval (>, =>, $)
-        const isBotSelf = m.key.fromMe && (senderNum === botNum || (!senderNum && m.key.fromMe));
+        // isBotSelf: bot kirim pesan ke grup sendiri (loop guard)
+        // Di PV: fromMe = owner self-bot → isOwn=true, bukan isBotSelf
+        const isBotSelf = m.key.fromMe && m.isGroup &&
+            (senderNum === botNum || (!senderNum && m.key.fromMe));
 
         let isOwn = false;
         // SECURITY: fromMe di GRUP tidak otomatis owner (bisa spoofed via inject/reflection)
-        // fromMe di PV aman — ini berarti owner chat ke bot sendiri
-        if (m.key.fromMe && !m.isGroup && !isBotSelf) {
-            // Owner kirim ke bot sendiri (bukan bot kirim ke diri sendiri)
+        // fromMe di PV aman — ini berarti owner chat ke bot sendiri (termasuk self-bot)
+        if (m.key.fromMe && !m.isGroup) {
+            // PV + fromMe = owner (baik self-bot maupun bot biasa)
             isOwn = true;
         } else if (senderNum) {
             isOwn = _ownerNums.includes(senderNum)
@@ -395,12 +394,18 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
 
         /* PUBLIC CHECK */
         // Jadibot selalu public (sock.public=true diset di jadibot.js)
-        // Bot utama: ikut setting config (public/self)
-        // FIX: m.key.fromMe di PV = owner yang kirim sendiri, selalu lolos
-        if (!manzxy.public && !_isJadiBot && !isBotSelf && !CreatorOnly && !isOwn) return;
+        // Bot utama: ikut setting config.selfMode
+        // FIX: fromMe di PV = owner yang kirim sendiri → SELALU lolos (self-bot)
+        // isBotSelf sekarang hanya true di grup (bot kirim ke grup) → tidak lolos di self-mode
+        if (!manzxy.public && !_isJadiBot && !isOwn && !m.key.fromMe) return;
 
         /* DATABASE */
         const user = getUser(senderJid);
+
+        /* CHAT STATS — track pesan di grup */
+        if (m.isGroup && senderJid && !m.key.fromMe) {
+            try { _db.addChat(from, senderJid); } catch {}
+        }
 
         let groupData = null;
         if (m.isGroup) groupData = getGroup(from);
@@ -506,15 +511,8 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
         /* MUTE CHECK di private - skip (mute hanya berlaku untuk grup) */
 
         /* ANTILINK LISTENER */
-        try {
-            const antilinkMod = require("./src/plugins/cjs/group-antilink.js");
-            await antilinkMod.listener(m, { manzxy, isAdmin, isOwn, botAdmin, from });
-        } catch {}
-
-        try {
-            const antilinkGcMod = require("./src/plugins/cjs/group-antilinkgc.js");
-            await antilinkGcMod.listener(m, { manzxy, isAdmin, isOwn, botAdmin, from, participants });
-        } catch {}
+        try { await _antilinkMod.listener(m, { manzxy, isAdmin, isOwn, botAdmin, from }); } catch {}
+        try { await _antilinkGcMod.listener(m, { manzxy, isAdmin, isOwn, botAdmin, from, participants }); } catch {}
 
         /* ── SEWABOT: INTERCEPTOR LINK GRUP (non-command) ──────────
          * Jika user ada di state waitLink, APAPUN yang dikirim (dengan
@@ -527,8 +525,7 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
             const _linkMatch = _rawBody.match(/chat\.whatsapp\.com\/([A-Za-z0-9]+)/);
             if (_linkMatch) {
                 try {
-                    const _db2 = require('./src/lib/database.js');
-                    const _pending = _db2.sewaPendingGet(senderJid);
+                    const _pending = _db.sewaPendingGet(senderJid);
                     if (_pending?.step === 'waitLink') {
                         // Ada link + user dalam state waitLink → langsung join
                         const _sewaMod = require('./src/plugins/cjs/main-sewabot.js');
@@ -571,6 +568,29 @@ module.exports = async function _msgHandler(manzxy, m, chatUpdate, store) {
         /* REPLY FUNCTION */
         const reply = (teks) =>
             manzxy.sendMessage(m.chat, { text: teks }, { quoted: m });
+
+        /* ============================================================
+           EVAL / SHELL TRIGGER — >, =>, $
+           Diproses sebelum CMD matching karena tidak pakai prefix bot.
+           Hanya owner yang bisa menggunakan.
+           ============================================================ */
+        if (isOwn) {
+            const _body = (m.text || m.body || '').trimStart();
+            const _isEvalAsync = _body.startsWith('=>');
+            const _isEvalSync  = !_isEvalAsync && _body.startsWith('>');
+            const _isShell     = _body.startsWith('$ ') || _body === '$';
+
+            if (_isEvalAsync || _isEvalSync || _isShell) {
+                try {
+                    const _evalPlugin = require('./src/plugins/cjs/owner-eval.js');
+                    await _evalPlugin(m, { manzxy, reply, isOwn, isBotSelf });
+                } catch (_ee) {
+                    logger.error('[EVAL]', _ee.message);
+                    reply('❌ Eval error: ' + _ee.message);
+                }
+                return;
+            }
+        }
 
         /* TIME & DATE */
         const time = moment().tz("Asia/Jakarta").format("HH:mm:ss");
@@ -638,12 +658,8 @@ isJadiBot: _isJadiBot,  // true jika request dari jadibot (bukan bot utama)
 
         if (CMD && _pluginsReady) {
             try {
-                // Cache hasil scan plugins — tidak perlu scan ulang tiap pesan
-                if (!global._pluginScanCache || Date.now() - (global._pluginScanCacheTs || 0) > 30_000) {
-                    global._pluginScanCache   = await scanAllPlugins();
-                    global._pluginScanCacheTs = Date.now();
-                }
-                const allPlugins = global._pluginScanCache;
+                // Pakai _allPluginsCache langsung — scanAllPlugins() sudah handle TTL
+                const allPlugins = await scanAllPlugins();
 
                 targetPlugin = allPlugins.find(plug => {
                     const cmds = Array.isArray(plug.command) ? plug.command : [plug.command];
@@ -651,11 +667,14 @@ isJadiBot: _isJadiBot,  // true jika request dari jadibot (bukan bot utama)
                 });
 
                 // Limit check: berlaku jika bukan owner, bukan premium (file), bukan premium (db)
-                // isBotSelf tidak bisa jalankan plugin owner-only (berbahaya)
+                // FIX: isBotSelf di grup (bot kirim ke grup) tidak bisa owner-only
+                // tapi fromMe di PV (self-bot) = isOwn sudah true → tidak masuk sini
                 if (targetPlugin?.owner && isBotSelf && !isOwn) {
                     return reply('⛔ Command ini hanya bisa dijalankan oleh owner asli.');
                 }
 
+                // FIX: isOwn sudah true saat fromMe PV — isBotSelf tidak perlu dicek ulang
+                // Tambah: _isSelfBotMode → fromMe selalu bebas limit
                 if (targetPlugin?.limit && !isOwn && !isPrem && !user.premium) {
                     const cost = targetPlugin.limitCost || 1;
                     if (user.limit < cost) {
@@ -689,7 +708,6 @@ Limit reset otomatis setiap 12 jam.`
             // Sertakan nomor bot utama agar user tahu harus chat ke mana
             const _mainNum = (() => {
                 try {
-                    const { config } = require('./config.js');
                     const n = String(config.owner?.[0] || '').replace(/[^0-9]/g, '');
                     return n.length >= 10 ? n : null;
                 } catch { return null; }
@@ -838,34 +856,8 @@ Limit reset otomatis setiap 12 jam.`
                 break;
             }
 
-            default: {
-                // Eval (=>) — owner asli only, BUKAN isBotSelf
-                if (budy.startsWith('=>') && isOwn && !isBotSelf) {
-                    try {
-                        const code   = budy.slice(2);
-                        const result = await eval(`(async () => { return ${code} })()`);
-                        await m.reply(util.format(result));
-                    } catch (e) { await m.reply(`❌ Error:\n${e.message}`); }
-                }
-                // Eval (>) — owner asli only, BUKAN isBotSelf
-                else if (budy.startsWith('>') && isOwn && !isBotSelf) {
-                    try {
-                        let evaled = await eval(budy.slice(1));
-                        if (typeof evaled !== 'string') evaled = util.inspect(evaled, { depth: 1 });
-                        await m.reply(evaled);
-                    } catch (e) { await m.reply(`❌ Error:\n${e.message}`); }
-                }
-                // Shell ($) — owner asli only, BUKAN isBotSelf
-                else if (budy.startsWith('$') && isOwn && !isBotSelf) {
-                    const { error, stdout, stderr } = await execWithTimeout(budy.slice(1), 15000);
-                    if (error)  return m.reply(`❌ Error:\n${error.message}`);
-                    if (stderr) return m.reply(`⚠️ stderr:\n${stderr}`);
-                    if (stdout) return m.reply(`📤 stdout:\n${stdout}`);
-                    return m.reply('✅ Command executed (no output)');
-                }
-                // isBotSelf mencoba eval/exec → diam saja (jangan reply, hindari loop)
+            default:
                 break;
-            }
         }
 
     } catch (error) {
