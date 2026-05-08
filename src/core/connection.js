@@ -1,7 +1,15 @@
 /**
- * connection.js — WA connection, reconnect, session recovery
+ * connection.js v2.2 — WA Connection Manager
  *
- * Dipisah dari index.js agar index.js hanya jadi entry point tipis.
+ * Fix utama v2.2:
+ *   - Circuit breaker: pause 3 menit jika gagal ≥5x / 2 menit
+ *   - _closeHandled flag: WS close + connection.update tidak double-reconnect
+ *   - _reconnecting guard: tidak ada dua proses reconnect jalan barengan
+ *   - _cleanupSock(): cleanup terpusat, bukan tersebar di setiap handler
+ *   - Heartbeat 10 menit / threshold 3x / delay start 60s — tidak false positive
+ *   - Bad MAC level 0: cukup clear keys, tidak reconnect
+ *   - Backoff maks 60s, counter tidak reset
+ *   - Kode 440: tunggu 30s, kode 515: 15s, kode 408/503: 20s
  *
  * Export:
  *   connectToWhatsApp()   — buat socket baru
@@ -30,24 +38,54 @@ const MediaHandler = require('./media.js');
 const store        = require('./store.js');
 const { startScheduler, setSchedulerSock } = require('./scheduler.js');
 
-const { useSQLiteAuthState, clearSignalKeys, deleteSession } = require('../lib/sqlite-session.js');
+const { useSQLiteAuthState, clearSignalKeys, deleteSession, validateSession, repairSession } = require('../lib/sqlite-session.js');
 const { imageToWebp, videoToWebp, writeExifImg, writeExifVid } = require('../lib/exif.js');
 const { forceJid }   = require('../lib/jid-utils.js');
 const { config, init } = require('../../config.js');
-
 const db = require('../lib/database.js');
 
 const _pinoLogger = pino({ level: 'silent' });
 
-/* ── State ───────────────────────────────────────────────────── */
+/* ── Socket state ────────────────────────────────────────────── */
 let _sockId            = 0;
-let _reconnects        = 0;
+let _reconnects        = 0;      // naik terus, tidak reset — backoff makin panjang
 let _reconnectTimer    = null;
+let _reconnecting      = false;  // guard: tidak ada dua reconnect barengan
 let _notifOnlineSentAt = 0;
 let _jadibotResumed    = false;
-let _signalErrCount    = 0;
-let _lastSignalClear   = 0;
 let _schedStarted      = false;
+
+/* ── Circuit breaker ─────────────────────────────────────────── */
+// Jika gagal reconnect terlalu sering → pause agar tidak spam server WA
+let _cbFailCount  = 0;
+let _cbWindowTs   = 0;
+let _cbTripped    = false;
+let _cbResetTimer = null;
+
+const CB_WINDOW    = 2 * 60_000;  // window 2 menit
+const CB_LIMIT     = 5;           // trip jika gagal ≥5x dalam window
+const CB_COOLDOWN  = 3 * 60_000;  // saat trip: pause 3 menit
+
+function _cbTick() {
+    const now = Date.now();
+    if (now - _cbWindowTs > CB_WINDOW) { _cbWindowTs = now; _cbFailCount = 0; }
+    _cbFailCount++;
+    if (!_cbTripped && _cbFailCount >= CB_LIMIT) {
+        _cbTripped = true;
+        logger.warn(`[CB] Circuit breaker TRIP — ${_cbFailCount}x gagal. Pause ${CB_COOLDOWN/1000}s...`);
+        if (_cbResetTimer) clearTimeout(_cbResetTimer);
+        _cbResetTimer = setTimeout(() => {
+            _cbTripped = false; _cbFailCount = 0; _cbWindowTs = 0;
+            if (_cbResetTimer) { clearTimeout(_cbResetTimer); _cbResetTimer = null; }
+            logger.info('[CB] Circuit breaker RESET — siap reconnect lagi');
+        }, CB_COOLDOWN);
+    }
+}
+
+function _cbReset() {
+    _cbFailCount = 0; _cbTripped = false; _cbWindowTs = 0;
+    if (_cbResetTimer) { clearTimeout(_cbResetTimer); _cbResetTimer = null; }
+}
 
 /* ── Group meta cache ────────────────────────────────────────── */
 const _metaCache = new Map();
@@ -77,27 +115,24 @@ const _loadOwners = () => {
     return s;
 };
 let _ownerNums = _loadOwners();
-setInterval(() => { _ownerNums = _loadOwners(); }, 60_000);
+setInterval(() => { _ownerNums = _loadOwners(); }, 120_000);
 
 /* ── Status store ────────────────────────────────────────────── */
 const _statusStore          = new Map();
-const STATUS_MAX_PER_SENDER = 50;
-const STATUS_STORE_EXPIRE   = 24 * 60 * 60_000;
+const STATUS_MAX_PER_SENDER = 20;
+const STATUS_STORE_EXPIRE   = 6 * 60 * 60_000;
 
 function _handleIncomingStatus(sock, mek) {
     try {
         const rawParticipant = mek.key?.participantAlt || mek.key?.participant || mek.key?.remoteJid || '';
         let resolvedJid = rawParticipant;
-
         if (rawParticipant.includes('@lid') || rawParticipant.includes('@s.lid')) {
             const resolved = forceJid(rawParticipant, [], sock);
             if (!resolved) return;
             resolvedJid = resolved;
         }
-
         const num = resolvedJid.split(':')[0].split('@')[0].replace(/[^0-9]/g, '');
         if (!num || num.length < 8) return;
-
         const msg = mek.message;
         if (!msg) return;
 
@@ -126,14 +161,10 @@ function _handleIncomingStatus(sock, mek) {
         _statusStore.set(num, list);
 
         try { sock.readMessages([mek.key]).catch(()=>{}); } catch {}
-
-        if (global._swgcForward)
-            global._swgcForward(sock, num, entry).catch(()=>{});
-
+        if (global._swgcForward) global._swgcForward(sock, num, entry).catch(()=>{});
     } catch {}
 }
 
-// Bersihkan status lama setiap jam
 setInterval(() => {
     const cutoff = Date.now() - STATUS_STORE_EXPIRE;
     for (const [num, list] of _statusStore) {
@@ -141,39 +172,66 @@ setInterval(() => {
         if (!fresh.length) _statusStore.delete(num);
         else _statusStore.set(num, fresh);
     }
-}, 60 * 60_000);
+}, 2 * 60 * 60_000);
 
-global._statusStore   = _statusStore;
+global._statusStore    = _statusStore;
 global.clearSignalKeys = () => clearSignalKeys('session/main');
 
-/* ── Pairing code ────────────────────────────────────────────── */
+/* ── Pairing ─────────────────────────────────────────────────── */
 const question = q => new Promise(res => {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
     rl.question(q, a => { rl.close(); res(a); });
 });
 
-/* ── Reconnect ───────────────────────────────────────────────── */
+/* ── Cleanup socket ──────────────────────────────────────────── */
+// Semua cleanup lewat sini — tidak ada removeAllListeners/ws.close tersebar
+function _cleanupSock(sock) {
+    if (!sock) return;
+    try {
+        if (sock._heartbeatTimer) {
+            clearInterval(sock._heartbeatTimer);
+            sock._heartbeatTimer = null;
+        }
+    } catch {}
+    try { sock.ev.removeAllListeners(); } catch {}
+    // Delay kecil agar tidak race dengan event yang masih diproses
+    setTimeout(() => { try { sock.ws?.close?.(); } catch {} }, 300);
+}
+
+/* ── Reconnect scheduler ─────────────────────────────────────── */
 function scheduleReconnect(fromSockId) {
-    if (fromSockId !== _sockId) return;
-    if (_reconnectTimer !== null) return;
+    if (fromSockId !== _sockId) return;   // socket sudah bukan yang aktif
+    if (_reconnectTimer !== null) return;  // sudah ada timer pending
+    if (_reconnecting) return;             // sedang proses reconnect
+    if (_cbTripped) {
+        logger.warn('[RECONNECT] Circuit breaker aktif — tunggu reset...');
+        return;
+    }
 
-    _reconnects++;
-    if (_reconnects > 15) { _reconnects = 1; }
+    _cbTick();
 
-    const delay = Math.min(3_000 * Math.pow(1.5, Math.min(_reconnects - 1, 8)), 30_000);
-    logger.warn(`[RECONNECT] #${_reconnects} in ${(delay/1000).toFixed(1)}s...`);
+    // Counter tidak pernah reset → backoff makin lama makin panjang
+    _reconnects = Math.min(_reconnects + 1, 12);
+    const delay = Math.min(3_000 * Math.pow(1.6, _reconnects - 1), 60_000);
+    logger.warn(`[RECONNECT] #${_reconnects} — retry dalam ${(delay/1000).toFixed(1)}s`);
 
-    _reconnectTimer = setTimeout(() => {
+    _reconnectTimer = setTimeout(async () => {
         _reconnectTimer = null;
         if (fromSockId !== _sockId) return;
-        connectToWhatsApp().catch(e => {
-            logger.error('[RECONNECT] Error:', e.message);
+        if (_cbTripped) { logger.warn('[RECONNECT] CB trip saat timer — skip'); return; }
+        _reconnecting = true;
+        try {
+            await connectToWhatsApp();
+        } catch (e) {
+            logger.error('[RECONNECT] Gagal:', e.message);
+            _reconnecting = false;
             scheduleReconnect(_sockId);
-        });
+        }
+        _reconnecting = false;
     }, delay);
 }
 
-/* ── Unwrap message ──────────────────────────────────────────── */
+/* ── Unwrap nested message ───────────────────────────────────── */
 function unwrapMsg(msg) {
     for (const w of ['ephemeralMessage','viewOnceMessage','viewOnceMessageV2',
                      'documentWithCaptionMessage','editedMessage'])
@@ -187,13 +245,21 @@ function unwrapMsg(msg) {
 async function connectToWhatsApp() {
     const mySockId = ++_sockId;
 
-    /* ── Load session ─────────────────────────────────────────── */
+    /* ── Session pre-check ────────────────────────────────────── */
+    const _sv = validateSession('session/main');
+    if (!_sv.valid) {
+        logger.warn(`[SESSION] Pre-check: invalid (${_sv.reason}) — repair level 0`);
+        repairSession('session/main', 0);
+    } else {
+        logger.info(`[SESSION] Pre-check OK | ${_sv.me} | keys: ${_sv.keyCount}`);
+    }
+
     let state, saveCreds;
     try {
         ({ state, saveCreds } = await useSQLiteAuthState('session/main'));
     } catch (e) {
         logger.error('[WA] Session load gagal:', e.message);
-        setTimeout(() => scheduleReconnect(mySockId), 5_000);
+        setTimeout(() => scheduleReconnect(mySockId), 8_000);
         return;
     }
 
@@ -202,7 +268,7 @@ async function connectToWhatsApp() {
     try {
         const r = await Promise.race([
             fetchLatestBaileysVersion(),
-            new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000)),
+            new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 8000)),
         ]);
         version = r.version;
     } catch { version = [2, 3000, 1021356099]; }
@@ -214,36 +280,54 @@ async function connectToWhatsApp() {
         version,
         logger:                         _pinoLogger,
         printQRInTerminal:              !usePairing,
-        connectTimeoutMs:               60_000,       // timeout 60s kalau gagal konek
-        defaultQueryTimeoutMs:          20_000,       // query timeout 20s
+        browser:                        ['Ubuntu', 'Chrome', '20.0.04'],
+        connectTimeoutMs:               60_000,   // 60s — VPS lambat perlu lebih lama
+        defaultQueryTimeoutMs:          20_000,   // 20s — toleran
         syncFullHistory:                false,
-        markOnlineOnConnect:            true,
-        keepAliveIntervalMs:            30_000,       // 30s lebih stabil dari 25s
-        retryRequestDelayMs:            5_000,        // retry lebih lambat biar tidak spam
-        maxMsgRetryCount:               5,            // lebih banyak retry sebelum give up
-        generateHighQualityLinkPreview: true,
+        markOnlineOnConnect:            false,    // hemat, tidak broadcast online
+        keepAliveIntervalMs:            45_000,   // 45s — tidak spam ping
+        retryRequestDelayMs:            3_000,
+        maxMsgRetryCount:               2,        // 2x — cepat give up decrypt error
+        generateHighQualityLinkPreview: false,
+        getMessage: async (key) => {
+            const jid = key.remoteJid;
+            if (jid && store.messages?.[jid]) {
+                const found = (store.messages[jid].array || store.messages[jid])
+                    .find?.(m => m.key?.id === key.id);
+                if (found?.message) return found.message;
+            }
+            return { conversation: '' };
+        },
         auth: {
             creds: state.creds,
             keys:  makeCacheableSignalKeyStore(state.keys, _pinoLogger),
         },
         patchMessageBeforeSending: msg => {
-            if (msg.buttonsMessage || msg.templateMessage || msg.listMessage) {
-                msg = { viewOnceMessage: { message: {
-                    messageContextInfo: { deviceListMetadataVersion: 2, deviceListMetadata: {} },
-                    ...msg,
-                }}};
+            const hasMsgType =
+                msg.buttonsMessage     ||
+                msg.listMessage        ||
+                msg.templateMessage    ||
+                msg.interactiveMessage ||
+                msg.buttonsResponseMessage;
+            if (hasMsgType) {
+                msg.messageContextInfo = { deviceListMetadata: {}, deviceListMetadataVersion: 2 };
+            }
+            if (msg.interactiveMessage) {
+                msg.interactiveMessage.header  = msg.interactiveMessage.header  || { hasMediaAttachment: false };
+                msg.interactiveMessage.body    = msg.interactiveMessage.body    || { text: '' };
+                msg.interactiveMessage.footer  = msg.interactiveMessage.footer  || { text: '' };
             }
             return msg;
         },
     });
 
     store.bind(manzxy.ev);
-    manzxy.public  = true;
-    manzxy._sockId = mySockId;
 
+    if (global._botPublic === undefined) global._botPublic = !config.selfMode;
+    manzxy.public  = global._botPublic;
+    manzxy._sockId = mySockId;
     global.mainSock   = manzxy;
     global._mainStore = store;
-
     setSchedulerSock(manzxy);
 
     /* ── Helpers ──────────────────────────────────────────────── */
@@ -276,6 +360,46 @@ async function connectToWhatsApp() {
         await manzxy.sendMessage(jid, { sticker: buf, ...opts }, { quoted });
         return buf;
     };
+
+    manzxy.sendButtons = async (jid, text, buttons = [], footer = '', type = 'button', quoted = null) => {
+        const ctx = quoted ? { quoted } : {};
+        try {
+            if (type === 'list') {
+                return await manzxy.sendMessage(jid, {
+                    listMessage: { title: text, description: footer, buttonText: '☰ Pilih', sections: buttons, listType: 1 }
+                }, ctx);
+            }
+            if (type === 'template') {
+                return await manzxy.sendMessage(jid, {
+                    templateMessage: {
+                        hydratedTemplate: {
+                            hydratedContentText: text,
+                            hydratedFooterText:  footer,
+                            hydratedButtons: buttons.map(b => ({
+                                index: b.index || 0,
+                                quickReplyButton: { displayText: b.text, id: b.id },
+                            })),
+                        }
+                    }
+                }, ctx);
+            }
+            return await manzxy.sendMessage(jid, {
+                text, footer,
+                buttons: buttons.map((b, i) => ({
+                    buttonId:   b.id || String(i),
+                    buttonText: { displayText: b.text || b.title || String(i+1) },
+                    type: 1,
+                })),
+                headerType: 1,
+            }, ctx);
+        } catch {
+            const opts = buttons.map((b, i) => `${i+1}. ${b.text || b.title}`).join('\n');
+            return await manzxy.sendMessage(jid, {
+                text: `${text}\n\n${opts}${footer ? '\n\n' + footer : ''}`
+            }, ctx);
+        }
+    };
+
     manzxy.sendMedia = async (jid, p, cap='', quoted='', opts={}) => {
         const { mime, data } = await manzxy.getFile(p, true);
         const type = mime.split('/')[0];
@@ -289,15 +413,15 @@ async function connectToWhatsApp() {
     /* ── Login (first time) ───────────────────────────────────── */
     if (!manzxy.authState.creds.registered) {
         if (usePairing) {
-            const phone = await question(chalk.blue('\n[LOGIN] Nomor HP (628xxx):\n> '));
+            const phone = await question(chalk.hex('#a855f7')('\n[LOGIN] Masukkan nomor HP (628xxx):\n> '));
             const code  = await manzxy.requestPairingCode(phone.trim(), init.customPair);
-            logger.success(`[LOGIN] Pairing code: ${code}`);
+            logger.success(`[LOGIN] Pairing code: ${chalk.bold(code)}`);
         } else {
-            logger.info('[WA] Menunggu QR scan...');
+            logger.info('[WA] Menunggu scan QR...');
         }
     }
 
-    /* ── Welcome / Leave ──────────────────────────────────────── */
+    /* ── Group participants update ────────────────────────────── */
     manzxy.ev.on('group-participants.update', async ({ id, participants, action }) => {
         if (mySockId !== _sockId) return;
         try {
@@ -319,7 +443,6 @@ async function connectToWhatsApp() {
                 const num  = jid.split(':')[0].split('@')[0];
                 const full = `${num}@s.whatsapp.net`;
 
-                // Foto profil — fallback ke default
                 let pp = config.thumbnail || 'https://telegra.ph/file/241d7169c11e03445940f.png';
                 try { pp = await manzxy.profilePictureUrl(full, 'image'); } catch {}
 
@@ -329,34 +452,72 @@ async function connectToWhatsApp() {
                     uname = ct?.notify || ct?.name || ct?.verifiedName || num;
                 } catch {}
 
+                const _now  = new Date();
+                const _date = _now.toLocaleDateString('id-ID', { timeZone: 'Asia/Jakarta', day: '2-digit', month: 'long', year: 'numeric' });
+                const _time = _now.toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta', hour12: false, hour: '2-digit', minute: '2-digit' });
                 const replace = t => (t||'')
                     .replace(/@user/g,  `@${num}`)
                     .replace(/@group/g, groupName)
                     .replace(/@desc/g,  groupDesc)
-                    .replace(/@count/g, memCount)
-                    .replace(/@name/g,  uname);
+                    .replace(/@count/g, String(memCount))
+                    .replace(/@name/g,  uname)
+                    .replace(/@date/g,  _date)
+                    .replace(/@time/g,  _time);
 
                 const isAdd = action === 'add';
-                const text  = replace(isAdd
-                    ? (gd.welcomeMessage || 'Halo @user, selamat datang di @group! 👋\n📊 Member ke-@count')
-                    : (gd.leaveMessage   || 'Selamat tinggal @user dari @group. 👋'));
+                if (!isAdd && gd.leaveEnabled === false) continue;
+                if (isAdd  && !gd.welcome) continue;
 
-                await manzxy.sendMessage(id, {
-                    text,
-                    contextInfo: { mentionedJid: [full], externalAdReply: {
-                        title:                 isAdd ? 'W E L C O M E' : 'G O O D B Y E',
-                        body:                  groupName,
-                        thumbnailUrl:          pp,
-                        mediaType:             1,
-                        renderLargerThumbnail: true,
-                        sourceUrl:             'https://whatsapp.com',
-                    }},
-                }).catch(()=>{});
+                const text = replace(isAdd
+                    ? (gd.welcomeMessage || [
+                        '┌─────────────────────┐',
+                        '│   👋  SELAMAT DATANG  │',
+                        '└─────────────────────┘',
+                        '',
+                        '🎉 Halo @name!',
+                        'Selamat bergabung di *@group*',
+                        '',
+                        '👥 Member ke-*@count*',
+                        '📅 @date pukul @time WIB',
+                      ].join('\n'))
+                    : (gd.leaveMessage || gd.leaveEnabled === false ? null : [
+                        '┌──────────────────────┐',
+                        '│   👋  SAMPAI JUMPA    │',
+                        '└──────────────────────┘',
+                        '',
+                        '*@name* telah meninggalkan grup.',
+                        '',
+                        '_Semoga jumpa lagi! 🙏_',
+                      ].join('\n')));
+
+                if (pp && pp !== (config.thumbnail || '')) {
+                    await manzxy.sendMessage(id, {
+                        image: { url: pp },
+                        caption: text,
+                        contextInfo: {
+                            mentionedJid: [full],
+                            externalAdReply: {
+                                title: isAdd ? '👋 WELCOME' : '👋 GOODBYE',
+                                body:  groupName,
+                                thumbnailUrl: pp,
+                                mediaType: 1,
+                                renderLargerThumbnail: true,
+                                sourceUrl: 'https://whatsapp.com',
+                            },
+                        },
+                    }).catch(() => manzxy.sendMessage(id, { text, mentions: [full] }).catch(()=>{}));
+                } else {
+                    await manzxy.sendMessage(id, {
+                        text,
+                        mentions: [full],
+                        contextInfo: { mentionedJid: [full] },
+                    }).catch(()=>{});
+                }
             }
         } catch (e) { logger.warn('[WELCOME]', e.message); }
     });
 
-    /* ── Messages ─────────────────────────────────────────────── */
+    /* ── Messages upsert ──────────────────────────────────────── */
     manzxy.ev.on('messages.upsert', async chatUpdate => {
         if (mySockId !== _sockId) return;
         try {
@@ -421,87 +582,148 @@ async function connectToWhatsApp() {
     });
 
     /* ── connection.update ────────────────────────────────────── */
+    let _closeHandled = false; // FIX: guard agar WS close + connection.update tidak double-reconnect
+
     manzxy.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
         if (mySockId !== _sockId) return;
 
         if (qr) {
-            logger.info('[WA] Scan QR:');
+            logger.info('[WA] Scan QR di bawah:');
             try { require('qrcode-terminal').generate(qr, { small: true }); } catch { console.log(qr); }
         }
 
         if (connection === 'close') {
+            if (_closeHandled) return;  // FIX: sudah ditangani, skip
+            _closeHandled = true;
+
             const code   = lastDisconnect?.error?.output?.statusCode;
             const errMsg = lastDisconnect?.error?.message || '';
-            logger.warn(`[WA] Disconnect — code: ${code}${errMsg ? ' | ' + errMsg : ''}`);
+            logger.warn(`[WA] Terputus — kode: ${code}${errMsg ? ' | ' + errMsg : ''}`);
 
-            if (manzxy._heartbeatTimer) { clearInterval(manzxy._heartbeatTimer); manzxy._heartbeatTimer = null; }
-            try { manzxy.ev.removeAllListeners(); } catch {}
-            try { manzxy.ws?.close?.(); } catch {}
+            _cleanupSock(manzxy);
 
+            // Logged out / banned — hapus session, tunggu login ulang
             if (code === DisconnectReason.loggedOut || code === 403) {
-                logger.error(`[WA] Logged out (${code}) — hapus session, minta login ulang...`);
+                logger.error(`[WA] Logged out (${code}) — session dihapus, tunggu pairing ulang`);
                 try { deleteSession('session/main'); } catch {}
-                setTimeout(() => { if (mySockId === _sockId) scheduleReconnect(mySockId); }, 5_000);
-                return;
-            }
-            if (code === 440) {
-                logger.warn('[WA] Multidevice conflict — tunggu 15s...');
-                setTimeout(() => { if (mySockId === _sockId) scheduleReconnect(mySockId); }, 15_000);
-                return;
-            }
-            if (code === 515) {
-                logger.warn('[WA] WA server restart (515) — tunggu 10s...');
                 setTimeout(() => { if (mySockId === _sockId) scheduleReconnect(mySockId); }, 10_000);
                 return;
             }
+            // Multidevice conflict — ada instance lain, tunggu lebih lama
+            if (code === 440) {
+                logger.warn('[WA] Multidevice conflict (440) — tunggu 30s...');
+                setTimeout(() => { if (mySockId === _sockId) scheduleReconnect(mySockId); }, 30_000);
+                return;
+            }
+            // WA server restart
+            if (code === 515) {
+                logger.warn('[WA] WA restart (515) — tunggu 15s...');
+                setTimeout(() => { if (mySockId === _sockId) scheduleReconnect(mySockId); }, 15_000);
+                return;
+            }
+            // Timeout / service unavailable
+            if (code === 408 || code === 503) {
+                logger.warn(`[WA] Server unavailable (${code}) — tunggu 20s...`);
+                setTimeout(() => { if (mySockId === _sockId) scheduleReconnect(mySockId); }, 20_000);
+                return;
+            }
+
             scheduleReconnect(mySockId);
 
         } else if (connection === 'connecting') {
-            logger.info('[WA] Menghubungkan...');
+            _closeHandled = false; // reset flag saat koneksi ulang dimulai
+            logger.info('[WA] Menghubungkan ke server WA...');
 
         } else if (connection === 'open') {
-            _reconnects     = 0;
-            _signalErrCount = 0;
+            // Berhasil terhubung — reset semua counter & CB
+            _reconnects = 0;
+            _reconnecting = false;
+            _cbReset();
             if (_reconnectTimer !== null) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
 
+            manzxy.public = (global._botPublic !== undefined) ? global._botPublic : !config.selfMode;
             setSchedulerSock(manzxy);
             global.mainSock = manzxy;
 
             const num  = (manzxy.user?.id || '').split(':')[0].split('@')[0] || '?';
             const name = manzxy.user?.name || config.nameBot || 'Bot';
-            logger.success(`[WA] Online! +${num} (${name})`);
+            logger.success(`[WA] Terhubung! +${num} (${name})`);
 
             if (!_schedStarted) { _schedStarted = true; startScheduler(manzxy); }
 
-            // heartbeat — cek koneksi setiap 2 menit, reconnect kalau zombie
-            if (manzxy._heartbeatTimer) clearInterval(manzxy._heartbeatTimer);
-            manzxy._heartbeatTimer = setInterval(async () => {
-                if (mySockId !== _sockId) { clearInterval(manzxy._heartbeatTimer); return; }
-                try {
-                    // coba query ringan — kalau timeout berarti koneksi zombie
-                    await Promise.race([
-                        manzxy.fetchStatus(manzxy.user?.id || '').catch(() => {}),
-                        new Promise((_, r) => setTimeout(() => r(new Error('heartbeat timeout')), 10_000)),
-                    ]);
-                } catch (he) {
-                    if (he.message === 'heartbeat timeout') {
-                        logger.warn('[WA] Heartbeat timeout — koneksi zombie, reconnect...');
+            /* ── Heartbeat ──────────────────────────────────────
+             * Cek WS readyState setiap 10 menit.
+             * Threshold 3x (bukan 2x) — toleran terhadap transient disconnect.
+             * Delay start 60s — WS pasti sudah stabil saat heartbeat pertama.
+             */
+            if (manzxy._heartbeatTimer) { clearInterval(manzxy._heartbeatTimer); manzxy._heartbeatTimer = null; }
+            let _hbFails = 0;
+            const _startHb = () => {
+                if (manzxy._heartbeatTimer) return;
+                manzxy._heartbeatTimer = setInterval(() => {
+                    if (mySockId !== _sockId) {
                         clearInterval(manzxy._heartbeatTimer);
-                        try { manzxy.ev.removeAllListeners(); } catch {}
-                        try { manzxy.ws?.close?.(); } catch {}
-                        scheduleReconnect(mySockId);
+                        manzxy._heartbeatTimer = null;
+                        return;
                     }
-                }
-            }, 2 * 60_000);
+                    try {
+                        const ws = manzxy.ws;
+                        if (!ws || typeof ws.readyState === 'undefined') return; // WS belum siap
+                        if (ws.readyState === 1 /* OPEN */) { _hbFails = 0; return; }
+                        _hbFails++;
+                        logger.warn(`[WA] Heartbeat: WS state=${ws.readyState} (gagal ${_hbFails}/3)`);
+                        if (_hbFails >= 3) {
+                            logger.warn('[WA] Koneksi zombie — cleanup & reconnect...');
+                            clearInterval(manzxy._heartbeatTimer);
+                            manzxy._heartbeatTimer = null;
+                            _cleanupSock(manzxy);
+                            scheduleReconnect(mySockId);
+                        }
+                    } catch (he) { logger.warn('[WA] Heartbeat error:', he?.message || he); }
+                }, 10 * 60_000);
+            };
+            setTimeout(_startHb, 60_000); // mulai setelah 60s
 
-            // Notif online — hanya sekali per proses
+            /* ── Notif online — hanya sekali per proses ─────── */
             if (!_notifOnlineSentAt) {
                 _notifOnlineSentAt = Date.now();
                 setTimeout(async () => {
                     if (mySockId !== _sockId) return;
-                    const ram = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
-                    const tgl = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
-                    const msg = `✅ *BOT ONLINE*\n\n🤖 ${name}  •  +${num}\n📅 ${tgl}\n💾 RAM: ${ram} MB`;
+                    const mem  = process.memoryUsage();
+                    const ram  = (mem.rss / 1024 / 1024).toFixed(1);
+                    const heap = (mem.heapUsed / 1024 / 1024).toFixed(1);
+                    const tgl  = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
+                    const mode = manzxy.public ? '🌐 Public' : '🔒 Self';
+                    const sv   = validateSession('session/main');
+                    const keyInfo = sv.valid ? `✅ OK (${sv.keyCount} keys)` : `⚠️ ${sv.reason}`;
+
+                    const msg = [
+                        '╔══════════════════════╗',
+                        '║   ✅  BOT ONLINE  ✅   ║',
+                        '╚══════════════════════╝',
+                        '',
+                        `🤖 *${name}*`,
+                        `📞 +${num}`,
+                        '',
+                        '─────────────────────',
+                        `📅 ${tgl}`,
+                        `💾 RAM   : ${ram} MB  (heap ${heap} MB)`,
+                        `🔑 Sesi  : ${keyInfo}`,
+                        `⚙️  Mode  : ${mode}`,
+                        `🟢 Node  : ${process.version}`,
+                        `📦 Versi : v${config.version || '2.1'}`,
+                        '─────────────────────',
+                        '',
+                        '📌 *Quick Commands:*',
+                        '  .ping      — cek status & latency',
+                        '  .runtime   — info RAM & uptime',
+                        '  .totalfitur — lihat semua fitur',
+                        '  .self/.public — ganti mode',
+                        '  .clearkeys — fix Bad MAC',
+                        '',
+                        '_Ketik .menu untuk daftar lengkap_',
+                    ].join('\n');
+
                     const owners = new Set([...(config.owner||[])]);
                     try { db.getOwners().forEach(n => owners.add(n)); } catch {}
                     for (const o of owners) {
@@ -511,44 +733,49 @@ async function connectToWhatsApp() {
                 }, 3000);
             }
 
-            // Auto-resume jadibot — hanya sekali
+            /* ── Auto-resume jadibot — hanya sekali ─────────── */
             if (!_jadibotResumed) {
                 _jadibotResumed = true;
                 setTimeout(async () => {
                     if (mySockId !== _sockId) return;
                     try { await global.autoResumeJadibots?.(); }
                     catch (e) { logger.error('[JB RESUME]', e.message); }
-                }, 6000);
+                }, 8000);
             }
         }
     });
 
+    /* ── Socket error ─────────────────────────────────────────── */
+    // Hanya reconnect untuk stream error yang benar-benar fatal
+    // Non-fatal (ENOTFOUND sementara, dll) — log saja
     manzxy.ev.on('error', e => {
         if (mySockId !== _sockId) return;
         const msg = e?.message || String(e);
         logger.warn('[WA] Socket error: ' + msg);
 
-        // stream errored / connection reset — langsung reconnect
-        if (
+        const isFatal =
             msg.includes('stream errored') ||
-            msg.includes('ECONNRESET') ||
-            msg.includes('ECONNREFUSED') ||
-            msg.includes('ETIMEDOUT') ||
-            msg.includes('read ECONNRESET') ||
-            msg.includes('write EPIPE')
-        ) {
-            logger.warn('[WA] Fatal stream error — reconnect...');
-            try { manzxy.ev.removeAllListeners(); } catch {}
-            try { manzxy.ws?.close?.(); } catch {}
-            setTimeout(() => scheduleReconnect(mySockId), 3_000);
+            msg.includes('ECONNRESET')     ||
+            msg.includes('ECONNREFUSED')   ||
+            msg.includes('ETIMEDOUT')      ||
+            msg.includes('write EPIPE');
+
+        if (isFatal) {
+            logger.warn('[WA] Stream error fatal — cleanup & reconnect...');
+            _cleanupSock(manzxy);
+            setTimeout(() => {
+                if (mySockId === _sockId) scheduleReconnect(mySockId);
+            }, 5_000);
         }
     });
 
-    // WS close tidak selalu trigger connection.update — handle manual
+    /* ── WS events — hanya log, reconnect diserahkan ke ev('error') ── */
+    // PENTING: jangan schedule reconnect di sini — sudah ada di connection.update
+    // Double-trigger dari sini adalah sumber utama reconnect storm
     try {
         manzxy.ws?.on('close', (code, reason) => {
             if (mySockId !== _sockId) return;
-            logger.warn(`[WA] WS closed — code: ${code} | ${reason?.toString?.() || ''}`);
+            logger.warn(`[WA] WS close — code: ${code} | ${reason?.toString?.() || ''}`);
         });
         manzxy.ws?.on('error', err => {
             if (mySockId !== _sockId) return;
@@ -556,54 +783,126 @@ async function connectToWhatsApp() {
         });
     } catch {}
 
+    /* ── Creds update ─────────────────────────────────────────── */
     manzxy.ev.on('creds.update', () => {
         if (mySockId !== _sockId) return;
         saveCreds();
     });
+
+    /* ── Anti-ban: throttle sendMessage ───────────────────────── */
+    if (config.antiBan && !manzxy._antiBanWrapped) {
+        manzxy._antiBanWrapped = true;
+        const _origSend = manzxy.sendMessage.bind(manzxy);
+        let _lastSendAt = 0;
+        manzxy.sendMessage = async (...args) => {
+            const delay = config.antiBanDelay || 800;
+            const now   = Date.now();
+            const wait  = delay - (now - _lastSendAt);
+            if (wait > 0) await new Promise(r => setTimeout(r, wait));
+            _lastSendAt = Date.now();
+            return _origSend(...args);
+        };
+    }
+
+    /* ── Auto-read ────────────────────────────────────────────── */
+    if (config.autoRead) {
+        manzxy.ev.on('messages.upsert', async ({ messages }) => {
+            for (const msg of messages) {
+                if (!msg.key?.remoteJid || msg.key?.fromMe) continue;
+                try { await manzxy.readMessages([msg.key]); } catch {}
+            }
+        });
+    }
 }
 
-/* ── Handle message decrypt errors ──────────────────────────── */
+/* ══════════════════════════════════════════════════════════════
+   BAD SESSION / DECRYPT ERROR HANDLER
+   Eskalasi: level 0 → clear signal keys (tidak reconnect)
+             level 1 → clear semua kecuali creds + reconnect
+             level 2 → delete session + alert owner
+   ══════════════════════════════════════════════════════════════ */
+let _badMacLevel    = 0;
+let _badMacCount    = 0;
+let _badMacWindowTs = 0;
+let _badMacCooldown = 0;
+
 function _handleMsgError(e, manzxy, mySockId) {
-    const eMsg = e.message || '';
+    const eMsg = e?.message || String(e);
 
-    if (eMsg.includes('closed session') || eMsg.includes('No matching session')) return;
-
+    // Error normal — skip
     if (
-        eMsg.includes('MessageCounterError') ||
+        eMsg.includes('closed session')     ||
+        eMsg.includes('No matching session') ||
+        eMsg.includes('Connection Closed')   ||
+        eMsg.includes('Stream Errored')
+    ) return;
+
+    const isBadSession =
+        eMsg.includes('MessageCounterError')           ||
         eMsg.includes('Key used already or never filled') ||
-        eMsg.includes('decryptWithSession') ||
-        eMsg.includes('Bad MAC') ||
-        eMsg.includes('decrypt failed') ||
-        eMsg.includes('Session not found') ||
-        eMsg.includes('Invalid session')
-    ) {
-        _signalErrCount++;
+        eMsg.includes('decryptWithSession')            ||
+        eMsg.includes('Bad MAC')                       ||
+        eMsg.includes('decrypt failed')                ||
+        eMsg.includes('Session not found')             ||
+        eMsg.includes('Invalid session');
+
+    if (isBadSession) {
         const now = Date.now();
-        if (_signalErrCount <= 10 && now - _lastSignalClear > 120_000) {
-            _lastSignalClear = now;
-            logger.warn(`[SESSION] Signal key corrupt #${_signalErrCount} — auto clear & reconnect...`);
+
+        // Reset window tiap 5 menit
+        if (now - _badMacWindowTs > 5 * 60_000) { _badMacWindowTs = now; _badMacCount = 0; }
+        _badMacCount++;
+
+        // Throttle: maks 1 action per 60 detik — kurangi frekuensi clear key
+        if (now - _badMacCooldown < 60_000) {
+            logger.warn(`[SESSION] Bad session throttled (${_badMacCount}x): ${eMsg.slice(0, 60)}`);
+            return;
+        }
+        _badMacCooldown = now;
+
+        // Eskalasi threshold lebih tinggi → kurangi false positive
+        if (_badMacCount > 20)     _badMacLevel = 2;
+        else if (_badMacCount > 8) _badMacLevel = 1;
+        else                       _badMacLevel = 0;
+
+        logger.warn(`[SESSION] Bad session #${_badMacCount} level=${_badMacLevel} — repair...`);
+
+        try {
+            const result = repairSession('session/main', _badMacLevel);
+            logger.success(`[SESSION] Repair OK (${result})`);
+            _badMacCount = 0;
+        } catch (re) {
+            logger.error('[SESSION] Repair error:', re.message);
+        }
+
+        // Alert owner jika level kritis
+        if (_badMacLevel >= 2) {
             try {
-                const ok = clearSignalKeys('session/main');
-                if (ok) logger.success('[SESSION] Signal keys cleared OK');
-            } catch (ce) { logger.error('[SESSION] clearSignalKeys error:', ce.message); }
-            try { manzxy.ev.removeAllListeners(); } catch {}
-            try { manzxy.ws?.close?.(); } catch {}
-            setTimeout(() => scheduleReconnect(mySockId), 2_000);
-        } else if (_signalErrCount > 10) {
-            logger.error('[SESSION] Signal error >10x berturut — jalankan .clearkeys dari bot!');
-        } else {
-            logger.warn('[SESSION] Signal error (throttled):', eMsg.slice(0, 80));
+                const owners = config?.owner || [];
+                const alertMsg = `⚠️ *[Session Critical]*\n\nSession Bad MAC terlalu sering (${_badMacCount}x).\nBot telah clear session dan akan reconnect.\n\nJika masih bermasalah:\n\`.clearkeys\``;
+                for (const o of owners) {
+                    const n = String(o).replace(/[^0-9]/g,'');
+                    if (n && manzxy) manzxy.sendMessage(n+'@s.whatsapp.net', { text: alertMsg }).catch(()=>{});
+                }
+            } catch {}
+        }
+
+        // Level 0 → cukup clear keys, tidak perlu putus koneksi
+        // Level 1+ → reconnect
+        if (_badMacLevel >= 1) {
+            _cleanupSock(manzxy);
+            setTimeout(() => scheduleReconnect(mySockId), 3_000);
         }
         return;
     }
 
-    logger.error('[MSG UPSERT]', eMsg);
+    logger.error('[MSG UPSERT]', eMsg.slice(0, 200));
 }
 
 /* ── Exports ─────────────────────────────────────────────────── */
-function getSock()         { return global.mainSock || null; }
-function getMetaCache()    { return _metaCache; }
-function cleanMeta()       { cleanupMetaCache(); }
-function getOwnerNums()    { return _ownerNums; }
+function getSock()      { return global.mainSock || null; }
+function getMetaCache() { return _metaCache; }
+function cleanMeta()    { cleanupMetaCache(); }
+function getOwnerNums() { return _ownerNums; }
 
 module.exports = { connectToWhatsApp, scheduleReconnect, getSock, getMetaCache, cleanMeta, getOwnerNums };
