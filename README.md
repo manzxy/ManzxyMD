@@ -1,3 +1,4 @@
+
 <div align="center">
 
 ![ManzxyMD](https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=200&section=header&text=ManzxyMD&fontSize=70&fontColor=fff&animation=twinkling&fontAlignY=38&desc=WhatsApp%20Bot%20Multi-Platform&descAlignY=62&descAlign=50)
@@ -74,7 +75,7 @@
 
 ```bash
 # 1. Clone
-git clone https://github.com/manzxy/ManzxyMD
+git clone [https://github.com/manzxy/ManzxyMD](https://github.com/manzxy/ManzxyMD)
 cd ManzxyMD
 
 # 2. Install
@@ -89,12 +90,9 @@ node index.js
 # Atau pakai PM2 (VPS):
 pm2 start ecosystem.config.js
 pm2 save && pm2 startup
+
 ```
-
----
-
-## ⚙️ Konfigurasi (`config.js`)
-
+## ⚙️ Konfigurasi (config.js)
 ```js
 const config = {
     owner:   ['628xxxx'],    // nomor owner — wajib diisi
@@ -118,34 +116,27 @@ const config = {
 
     telegram: { token: 'BOT_TOKEN', chat_id: 'CHAT_ID' },
 };
+
 ```
-
----
-
 ## 🔧 Perintah Owner
-
 | Command | Fungsi |
-|---------|--------|
-| `.self` / `.public` | Toggle mode bot |
-| `.mode` | Cek mode saat ini |
-| `.ping` | Status & latency |
-| `.runtime` | RAM & uptime |
-| `.restart` | Restart bot |
-| `.errlog` | 10 error terakhir |
-| `.totalfitur` | Semua plugin aktif |
-| `.clearkeys` | Fix Bad MAC manual |
-| `> kode` | Eval JS |
-| `=> kode` | Eval JS async |
-| `$ perintah` | Exec bash |
-| `.sf upload` | Upload plugin via WA |
-| `.github push` | Push ke GitHub |
-
----
-
+|---|---|
+| .self / .public | Toggle mode bot |
+| .mode | Cek mode saat ini |
+| .ping | Status & latency |
+| .runtime | RAM & uptime |
+| .restart | Restart bot |
+| .errlog | 10 error terakhir |
+| .totalfitur | Semua plugin aktif |
+| .clearkeys | Fix Bad MAC manual |
+| > kode | Eval JS |
+| => kode | Eval JS async |
+| $ perintah | Exec bash |
+| .sf upload | Upload plugin via WA |
+| .github push | Push ke GitHub |
 ## 🤖 Auto-Fix System
-
 | Error | Aksi |
-|-------|------|
+|---|---|
 | Bad MAC / MessageCounterError (jarang) | Clear signal keys — **tidak** reconnect |
 | Bad MAC berulang >8x / 5 menit | Clear semua keys kecuali creds + reconnect |
 | Bad MAC berulang >20x / 5 menit | Delete session + alert owner |
@@ -153,13 +144,8 @@ const config = {
 | Gagal reconnect ≥5x / 2 menit | Circuit breaker — pause 3 menit |
 | Stream error / ECONNRESET | Cleanup + reconnect setelah 5s |
 | Error berulang >5x / 5 menit | Alert WA ke owner |
-
----
-
 ## 🔌 Cara Tambah Plugin
-
-Buat file di `src/plugins/cjs/nama-plugin.js`:
-
+Buat file di src/plugins/cjs/nama-plugin.js:
 ```js
 'use strict';
 
@@ -180,16 +166,9 @@ handler.fitur = {
 };
 
 module.exports = handler;
+
 ```
-
-> ⚠️ **Penting:** Helper/config bersama wajib di `src/lib/` — jangan di `src/plugins/` (cache 30 detik, tidak reliable untuk shared state).
-
-Hot-reload otomatis tiap **60 detik** — tidak perlu restart.
-
----
-
 ## 📁 Struktur
-
 ```
 ManzxyMD/
 ├── index.js              # Entry point + banner
@@ -215,33 +194,22 @@ ManzxyMD/
 │       ├── cjs/          # ← tambah plugin di sini
 │       └── esm/
 └── session/              # Auto-created
+
 ```
-
----
-
 ## ❓ FAQ
-
 **Q: Bot terus reconnect / log spam connecting?**
-> Circuit breaker otomatis pause 3 menit jika gagal ≥5x dalam 2 menit. Double-trigger dari WS close + connection.update sudah diguard dengan `_closeHandled` flag.
-
-**Q: Bad MAC terus muncul walau `.clearkeys`?**
+> Circuit breaker otomatis pause 3 menit jika gagal ≥5x dalam 2 menit. Double-trigger dari WS close + connection.update sudah diguard dengan _closeHandled flag.
+> 
+**Q: Bad MAC terus muncul walau .clearkeys?**
 > Auto-fix bertahap: level 0 (jarang) hanya clear keys, level 1 (>8x) clear semua, level 2 (>20x) delete session + alert owner. Jika level 2 sudah jalan dan masih terjadi, lakukan pairing ulang.
-
-**Q: Server lag / CPU tinggi saat bot nyala?**
-> Penyebab biasa: reconnect storm (sekarang sudah ada circuit breaker), heartbeat terlalu sering (sekarang 10 menit), atau WAL SQLite bloat (checkpoint tiap 10 menit). Pastikan `antiBan: true` dan `antiBanDelay` tidak terlalu rendah.
-
-**Q: JadiBot gagal reconnect terus?**
-> Exponential backoff — setelah 10x gagal, JadiBot masuk `stopped`. Resume dengan `.startjadibot nomor`.
-
-**Q: Mode self balik public setelah reconnect?**
-> Sudah diperbaiki — mode disimpan ke `global._botPublic`, di-restore otomatis setiap reconnect.
-
----
-
+> 
+## 🤝 TQTO & Credits
+Special thanks to everyone who helped build this project:
+ * **WJayadana** — Creator Ori / Base Ori.
+ * **Manzxy** — Recode, Rename, & Logic Enhancement.
+ * **Claude AI** — Bug fixing, feature addition, and code optimization.
+ * **Baileys** — Base library for WhatsApp.
 <div align="center">
-
-**ManzxyMD v2.1** · Dibuat dengan ❤️ oleh [Manzxy](https://wa.me/6288989721627)
-
-[![WhatsApp](https://img.shields.io/badge/Contact-WhatsApp-25D366?style=for-the-badge&logo=whatsapp&logoColor=white)](https://wa.me/6288989721627)
-
+**ManzxyMD v2.1** · Dibuat dengan ❤️ oleh Manzxy
+WhatsApp
 </div>
